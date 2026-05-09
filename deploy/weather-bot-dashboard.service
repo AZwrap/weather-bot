@@ -1,0 +1,33 @@
+# systemd unit for the Streamlit dashboard.
+#
+# Install:
+#   sudo cp deploy/weather-bot-dashboard.service /etc/systemd/system/
+#   sudo sed -i "s|/PROJECT_PATH|$(pwd)|g; s|/USER|$USER|g" /etc/systemd/system/weather-bot-dashboard.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now weather-bot-dashboard
+#
+# Access via SSH tunnel from your laptop (RECOMMENDED — keeps dashboard private):
+#   ssh -L 8501:localhost:8501 user@your-vps
+#   then open  http://localhost:8501  in your browser
+#
+# Logs:
+#   sudo journalctl -u weather-bot-dashboard -f
+[Unit]
+Description=Weather Bot Streamlit Dashboard
+After=network.target
+
+[Service]
+Type=simple
+User=/USER
+WorkingDirectory=/PROJECT_PATH/Weather_Bot
+ExecStart=/PROJECT_PATH/Weather_Bot/.venv/bin/streamlit run dashboard.py \
+    --server.port 8501 \
+    --server.address 127.0.0.1 \
+    --server.headless true \
+    --browser.gatherUsageStats false
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

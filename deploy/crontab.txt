@@ -1,0 +1,37 @@
+# Polymarket weather bot — cron schedule (all times UTC)
+#
+# Install:  crontab deploy/crontab.txt
+# View:     crontab -l
+# Edit:     crontab -e
+#
+# IMPORTANT: replace /PROJECT_PATH/Weather_Bot below with the absolute path
+# returned by `pwd` at the project root.
+
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+SHELL=/bin/bash
+
+# ── Every 20 min: snapshot live forecasts + market prices ─────────────────
+# Captures intraday repricings and forecast updates (ECMWF runs every 6 hr
+# at 00/06/12/18 UTC). 20-min cadence gives 3× the market-microstructure
+# data points vs hourly — useful for backtesting maker-ladder fill behaviour
+# (ECMWF itself only updates 4×/day, so the extra ticks are pure market data).
+# Idempotent within the snapshot window. Open-Meteo non-commercial API limit
+# is ~10k req/day; this runs at ~70% utilisation, leaving headroom for
+# dashboard live scans + retries on transient failures.
+# Storage: ~7 MB/month, ~85 MB/year — well within VPS budget.
+*/20 * * * * /PROJECT_PATH/Weather_Bot/deploy/run.sh log_forecasts >> /PROJECT_PATH/Weather_Bot/data/log.out 2>&1
+
+# ── Daily 12:00 UTC: resolve yesterday's records ───────────────────────────
+# METAR (Iowa State ASOS) data is fresh within ~1 hour of observation. We
+# run at 12 UTC (not 06) so west-coast US stations have completed their
+# local day (LA May 8 PDT ends 07 UTC May 9 — by 12 UTC METAR is archived).
+# lag-days=1 → resolves yesterday's records in station-local time.
+0 12 * * *  /PROJECT_PATH/Weather_Bot/deploy/run.sh resolve_log     >> /PROJECT_PATH/Weather_Bot/data/log.out 2>&1
+
+# ── Weekly Sunday 04:00 UTC: retrain bias table on rolling 365 d window ────
+# Keeps biases current as model versions and station equipment drift.
+0  4 * * 0  /PROJECT_PATH/Weather_Bot/deploy/run.sh train_bias      >> /PROJECT_PATH/Weather_Bot/data/log.out 2>&1
+
+# ── (Optional) Hourly health check — appends to data/health.out only on WARN/FAIL ──
+# Uncomment to enable. Exit code 0 = silent; non-zero triggers the failure log line.
+# 30 * * * *  cd /PROJECT_PATH/Weather_Bot && .venv/bin/python health_check.py --quiet --no-net || echo "$(date -u '+%Y-%m-%d %H:%M:%S UTC') health WARN/FAIL" >> data/health.out

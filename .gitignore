@@ -1,0 +1,29 @@
+# Virtual environment
+.venv/
+venv/
+
+# Python bytecode and caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+
+# Generated data
+data/
+bias_table.json
+*.tmp
+
+# OS / editor artefacts
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+
+# Local sensitive files (never commit secrets)
+.env
+*.key
+*.pem
+checkpoints/

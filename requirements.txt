@@ -1,0 +1,10 @@
+httpx>=0.27
+numpy>=2.0
+pandas>=2.2
+scipy>=1.13
+python-dateutil>=2.9
+openpyxl>=3.1
+
+# Dashboard (optional but installed by default for ease of deploy)
+streamlit>=1.30
+plotly>=5.18
