@@ -40,6 +40,7 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
 import httpx
 
 from weather_bot.exclusions import load_active_exclusions
+from weather_bot.fees import fetch_live_fee_config, warn_if_fee_config_changed
 from weather_bot.guaranteed_no_buy import detect_and_execute_guaranteed_buys
 from weather_bot.intraday import (
     DEFAULT_INTRADAY_LOG_PATH,
@@ -69,6 +70,14 @@ from weather_bot.v2_conditional_preposit import (
 KILL_SWITCH = Path("KILL_SWITCH")
 ALL_STRATEGIES = ("metar", "layer7", "v2")
 
+# ── HARD PAPER-ONLY GATE ──────────────────────────────────────────────
+# Force every strategy to paper mode (dry-run client) regardless of
+# CLI flags or environment. Set to False ONLY after the publication-
+# window shadow harness has accumulated enough data to justify live
+# trading. While True, `--live` is ignored — the build_client factory
+# always returns a dry-run client.
+PAPER_ONLY: bool = True
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Slim scan — lite rebuild.")
@@ -92,11 +101,23 @@ def parse_args() -> argparse.Namespace:
 
 
 def build_client(live: bool):
-    """Return an ExecutionClient. Dry-run unless --live AND LIVE_OK=1."""
+    """Return an ExecutionClient. Dry-run unless --live AND LIVE_OK=1
+    AND PAPER_ONLY is False. The PAPER_ONLY constant short-circuits
+    everything below."""
     from weather_bot.execution.client import ExecutionClient
     from weather_bot.execution.safety import TradingConfig
 
-    cfg = TradingConfig(enabled=live)
+    cfg = TradingConfig(enabled=live and not PAPER_ONLY)
+
+    if PAPER_ONLY:
+        if live:
+            print(
+                "[paper-only] --live requested but PAPER_ONLY=True is set in "
+                "slim_scan.py. Falling back to dry-run client. Flip PAPER_ONLY "
+                "to False to enable live submissions.",
+                file=sys.stderr,
+            )
+        return ExecutionClient.dry_run(cfg)
 
     if not live:
         return ExecutionClient.dry_run(cfg)
@@ -143,6 +164,15 @@ async def run_scan(args: argparse.Namespace) -> int:
     )
 
     async with httpx.AsyncClient(timeout=30.0) as http:
+        # Cheap one-time live fee sanity check (cached 24h, polite).
+        fee_cfg = await fetch_live_fee_config(http)
+        if fee_cfg is not None:
+            warn_if_fee_config_changed(fee_cfg)
+            print(
+                f"[fees] taker_rate={fee_cfg.taker_fee_rate:.4f} "
+                f"rebate={fee_cfg.maker_rebate_rate} source={fee_cfg.source}"
+            )
+
         events = await fetch_all_temperature_events(http)
 
         # Refresh CLOB top-of-book — gamma's bestBid/bestAsk are stale.

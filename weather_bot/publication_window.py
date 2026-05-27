@@ -65,11 +65,18 @@ class PublicationWindowRecord:
     midend_local_utc: str
     offset_h_after_midend: float
 
-    # METAR-derived (our view of the truth)
+    # METAR-derived (our view, may differ from oracle by up to ~1°C)
     metar_final_extreme_c: float | None = None
     metar_n_observations: int = 0
     metar_max_gap_min: float | None = None
     metar_last_obs_local_iso: str | None = None
+
+    # Wunderground-derived (the oracle's view — what Polymarket reads)
+    wug_daily_max_c: float | None = None
+    wug_daily_min_c: float | None = None
+    wug_n_observations: int = 0
+    wug_last_obs_utc: str | None = None
+    wug_status: str | None = None
 
     # Polymarket
     event_slug: str | None = None
@@ -165,6 +172,7 @@ async def snapshot_one(
     from .observations import fetch_metar_hourly_range
     from .pnl import _rounded_observation, bucket_won
     from .polymarket import parse_bucket
+    from .wunderground import fetch_wunderground_daily
 
     now_utc = now_utc or datetime.now(timezone.utc)
     midend_utc = midend_local_utc(target_date, station)
@@ -218,12 +226,20 @@ async def snapshot_one(
         except Exception:
             pass
 
+    # Fetch Wunderground in parallel-ish (after METAR). WUG is the oracle
+    # truth — when it returns a value, we trust it over METAR for the
+    # matched_bucket calculation.
+    wug = await fetch_wunderground_daily(station.station_id, target_date, http)
+    wug_extreme_c = wug.daily_max_c if target == "max" else wug.daily_min_c
+
     # Snapshot all buckets in the event.
     buckets: list[BucketSnapshot] = []
     matched_kind: str | None = None
     matched_thr: int | None = None
-    if metar_final_extreme_c is not None:
-        actual_int = _rounded_observation(metar_final_extreme_c, station.unit)
+    # Prefer WUG when present (it's the oracle); fall back to METAR.
+    truth_c = wug_extreme_c if wug_extreme_c is not None else metar_final_extreme_c
+    if truth_c is not None:
+        actual_int = _rounded_observation(truth_c, station.unit)
     else:
         actual_int = None
 
@@ -232,16 +248,22 @@ async def snapshot_one(
             kind, thr = parse_bucket(m)
         except Exception:
             continue
+        # Polymarket binary buckets: NO book is the inverse of YES book
+        # (no separate no_ask/no_bid field on PolymarketMarket).
+        yes_ask = getattr(m, "yes_ask", None)
+        yes_bid = getattr(m, "yes_bid", None)
+        no_ask = (1.0 - yes_bid) if yes_bid is not None else None
+        no_bid = (1.0 - yes_ask) if yes_ask is not None else None
         buckets.append(BucketSnapshot(
             kind=kind,
             threshold=thr,
             label=getattr(m, "bucket_label", ""),
             yes_token_id=getattr(m, "yes_token_id", None),
             no_token_id=getattr(m, "no_token_id", None),
-            yes_ask=getattr(m, "yes_ask", None),
-            yes_bid=getattr(m, "yes_bid", None),
-            no_ask=getattr(m, "no_ask", None),
-            no_bid=getattr(m, "no_bid", None),
+            yes_ask=yes_ask,
+            yes_bid=yes_bid,
+            no_ask=no_ask,
+            no_bid=no_bid,
             volume_24h_usd=getattr(m, "volume_24hr", None),
         ))
         if actual_int is not None and matched_kind is None:
@@ -259,6 +281,11 @@ async def snapshot_one(
         metar_n_observations=metar_n,
         metar_max_gap_min=metar_max_gap_min,
         metar_last_obs_local_iso=metar_last_obs_iso,
+        wug_daily_max_c=wug.daily_max_c,
+        wug_daily_min_c=wug.daily_min_c,
+        wug_n_observations=wug.n_observations,
+        wug_last_obs_utc=wug.last_observation_utc,
+        wug_status=wug.raw_status,
         event_slug=ev.slug,
         event_id=ev.id,
         buckets=buckets,

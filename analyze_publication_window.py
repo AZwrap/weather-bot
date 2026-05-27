@@ -159,42 +159,63 @@ def main() -> int:
         if n >= args.min_n:
             print(f"{bin_l:<14} {n:>4} {pct:>12.1f}%")
 
-    # ── 2) METAR↔Polymarket agreement ────────────────────────────────
-    # For each (station, date) with resolution AND at least one
-    # snapshot whose matched_bucket is non-null: do they agree?
-    agreement: list[bool] = []
-    disagreements: list[tuple[str, str, int | None, int | None]] = []
+    # ── 2) Bucket agreement: METAR vs Polymarket, and WUG vs Polymarket
+    # Since WUG is Polymarket's source, WUG↔PM should be ~100%.
+    # METAR↔PM measures how often raw METAR-derived buckets agree with
+    # the oracle (the 0.5-1°C disagreement that motivated the WUG fetch).
+    metar_agreement: list[bool] = []
+    wug_agreement: list[bool] = []
+    metar_disagreements: list[tuple[str, str, int | None, int | None]] = []
+    wug_disagreements: list[tuple[str, str, int | None, int | None]] = []
+
+    def _bucket_for_value(forward_record: dict, value_c: float) -> tuple[str | None, int | None]:
+        return _pm_resolved_bucket(forward_record, value_c)
+
     for (sid, tgt, td), market_snaps in per_market.items():
         res = by_resolution.get((sid, td))
-        if not res:
+        if not res or res.get("actual_obs_c") is None:
             continue
-        actual_c = res.get("actual_obs_c")
-        if actual_c is None:
+        pm_kind, pm_thr = _pm_resolved_bucket(res, res["actual_obs_c"])
+        if pm_kind is None:
             continue
-        # Find Polymarket's resolved bucket from the resolution record
-        # (forward_log bucket_snapshots).
-        pm_kind, pm_thr = _pm_resolved_bucket(res, actual_c)
-        # Find our matched bucket from the latest snapshot
         latest = max(market_snaps, key=lambda s: s.get("snapshot_ts_utc", ""))
-        my_kind = latest.get("matched_bucket_kind")
-        my_thr = latest.get("matched_bucket_threshold")
-        if pm_kind is None or my_kind is None:
-            continue
-        match = (pm_kind == my_kind and pm_thr == my_thr)
-        agreement.append(match)
-        if not match:
-            disagreements.append((sid, td, my_thr, pm_thr))
+        # METAR-derived bucket from latest snapshot's metar extreme
+        m_c = latest.get("metar_final_extreme_c")
+        if m_c is not None:
+            m_kind, m_thr = _bucket_for_value(res, m_c)
+            if m_kind is not None:
+                match = (m_kind == pm_kind and m_thr == pm_thr)
+                metar_agreement.append(match)
+                if not match:
+                    metar_disagreements.append((sid, td, m_thr, pm_thr))
+        # WUG-derived bucket from latest snapshot
+        wug_c = (latest.get("wug_daily_max_c") if tgt == "max"
+                 else latest.get("wug_daily_min_c"))
+        if wug_c is not None:
+            w_kind, w_thr = _bucket_for_value(res, wug_c)
+            if w_kind is not None:
+                match = (w_kind == pm_kind and w_thr == pm_thr)
+                wug_agreement.append(match)
+                if not match:
+                    wug_disagreements.append((sid, td, w_thr, pm_thr))
 
     print()
-    print("=== 2) METAR↔Polymarket bucket agreement ===")
-    if agreement:
-        rate = 100.0 * sum(1 for a in agreement if a) / len(agreement)
-        print(f"  N: {len(agreement)}   agreement: {rate:.1f}%")
-        if disagreements:
-            print("  Sample disagreements:")
-            for sid, td, mt, pt in disagreements[:10]:
-                print(f"    {sid:6s} {td:10s}  our:{mt}  pm:{pt}")
-    else:
+    print("=== 2) Bucket agreement vs Polymarket oracle ===")
+    if metar_agreement:
+        rate = 100.0 * sum(1 for a in metar_agreement if a) / len(metar_agreement)
+        print(f"  METAR↔PM   N={len(metar_agreement)}   agreement: {rate:.1f}%")
+        if metar_disagreements:
+            print("    sample disagreements (our bucket | pm bucket):")
+            for sid, td, mt, pt in metar_disagreements[:5]:
+                print(f"      {sid:6s} {td:10s}  metar:{mt}  pm:{pt}")
+    if wug_agreement:
+        rate = 100.0 * sum(1 for a in wug_agreement if a) / len(wug_agreement)
+        print(f"  WUG↔PM     N={len(wug_agreement)}   agreement: {rate:.1f}%")
+        if wug_disagreements:
+            print("    sample disagreements (our bucket | pm bucket):")
+            for sid, td, mt, pt in wug_disagreements[:5]:
+                print(f"      {sid:6s} {td:10s}  wug:{mt}  pm:{pt}")
+    if not metar_agreement and not wug_agreement:
         print("  (no joinable resolutions yet)")
 
     # ── 3) Winning-bucket price by offset (mispricing) ───────────────

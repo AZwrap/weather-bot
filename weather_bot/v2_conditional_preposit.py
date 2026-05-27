@@ -417,7 +417,26 @@ def submit_v2_conditional_preposit_orders(
 
             counts["placed"] += 1
 
-            # Log V2 decision for offline analyzer
+            # ── Maker vs Taker counterfactual ──
+            # Maker (what V2 actually does): GTC post_only BUY NO at
+            # `threshold` ($0.82). Fills iff NO ask crosses down to
+            # threshold — i.e., yes_bid rises to 1 − threshold = $0.18.
+            #
+            # Taker (counterfactual): immediately BUY NO at current ask.
+            # NO ask on Polymarket binary buckets ≈ 1 − yes_bid (the bot
+            # never stores a separate no_ask field). Fee per share at
+            # entry price p is 0.05 × p × (1 − p). We log enough fields
+            # here for the offline analyzer to compute resolution-PnL
+            # for both modes.
+            taker_no_ask = (
+                1.0 - float(m.yes_bid) if m.yes_bid is not None else None
+            )
+            taker_fee_per_share = (
+                0.05 * taker_no_ask * (1.0 - taker_no_ask)
+                if taker_no_ask is not None else None
+            )
+            maker_fee_per_share = 0.05 * float(threshold) * (1.0 - float(threshold))
+
             _log_decision({
                 "ts_utc": datetime.now(timezone.utc).isoformat(),
                 "decision": "placed",
@@ -429,7 +448,15 @@ def submit_v2_conditional_preposit_orders(
                 "bucket_kind": kind,
                 "yes_ask": float(m.yes_ask),
                 "yes_bid": float(m.yes_bid) if m.yes_bid is not None else None,
-                "intended_price": float(threshold),
+                # MAKER intent (what we placed):
+                "maker_intended_price": float(threshold),
+                "maker_fee_per_share": maker_fee_per_share,
+                # TAKER counterfactual (snapshot at fire time):
+                "taker_no_ask": taker_no_ask,
+                "taker_fee_per_share": taker_fee_per_share,
+                "taker_size_shares": (
+                    (size_usd / taker_no_ask) if taker_no_ask else None
+                ),
                 "intended_size_usd": float(size_usd),
                 "gate_bucket_label": gate_bucket.bucket_label,
                 "gate_bucket_yes_ask": float(gate_bucket_ask),
