@@ -238,10 +238,9 @@ def detect_and_execute_guaranteed_buys(
     station = STATIONS_BY_ID.get(station_id)
     if station is None:
         return dict(counts)
-    if client.is_dry_run:
-        if verbose:
-            print(f"  [layer7] dry-run client — skipping for {station_id}")
-        return {"reason": "dry-run"}
+    # Note: when client.is_dry_run, client.submit_order returns a
+    # synthetic OrderResult(ok=True, dry_run=True). We still run the
+    # full strategy logic so paper-logs accumulate.
 
     # STATION-LOCAL DATE GUARD (2026-05-22 LTFM incident). Layer 7 reasons
     # about "today's observed extreme has passed bucket X, so bucket X is

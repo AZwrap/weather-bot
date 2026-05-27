@@ -155,10 +155,9 @@ def detect_and_execute_high_bucket_no(
     if station is None:
         return dict(counts)
 
-    if client.is_dry_run:
-        if verbose:
-            print(f"  [hbn] dry-run client — skipping for {station_id}")
-        return {"reason": "dry-run"}
+    # Note: when client.is_dry_run, client.submit_order returns a
+    # synthetic OrderResult(ok=True, dry_run=True). We still run the
+    # full strategy logic so paper-logs accumulate.
 
     # Excluded stations (DNMM, ZGSZ, WIHH, ZSQD as of decommission)
     excluded = {sid for sid, _t in load_active_exclusions(datetime.now(timezone.utc).date())}
