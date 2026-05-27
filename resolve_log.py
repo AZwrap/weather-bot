@@ -112,45 +112,79 @@ async def main() -> None:
                 return label, threshold
         return None
 
-    async def resolve_one(r: ForwardLogRecord, client: httpx.AsyncClient) -> bool:
-        station = STATIONS_BY_ID.get(r.station_id)
+    # Dedupe pending by (station_id, target, target_date) — multiple records
+    # at different issue times on the same station-target-date all get the
+    # SAME resolution. With same-day logging + 20-min cron, ~20-50 records
+    # exist per (station, target, date), so deduping cuts METAR + Gamma
+    # calls by ~20-50× and resolve_log runtime from ~30min to ~1min.
+    # Added 2026-05-10.
+    unique_keys: dict[tuple[str, str, "date"], list[ForwardLogRecord]] = {}
+    for r in pending:
+        key = (r.station_id, r.target, r.target_date)
+        unique_keys.setdefault(key, []).append(r)
+    print(
+        f"  deduped to {len(unique_keys)} unique (station, target, date) "
+        f"resolutions ({len(pending)}/{len(unique_keys):.1f}× duplication)"
+    )
+
+    async def resolve_group(
+        key: tuple[str, str, "date"],
+        records_for_key: list[ForwardLogRecord],
+        client: httpx.AsyncClient,
+    ) -> int:
+        """Resolve all records sharing a (station, target, date) with ONE
+        METAR fetch + ONE Gamma fetch. Returns count of records updated."""
+        sid, tgt, td = key
+        station = STATIONS_BY_ID.get(sid)
         if station is None:
-            print(f"!! unknown station_id {r.station_id} — skipping")
-            return False
+            print(f"!! unknown station_id {sid} — skipping {len(records_for_key)} records")
+            return 0
         async with sem:
             try:
-                # Use METAR (Iowa State ASOS) as truth — matches Polymarket
-                # resolution. Falls back to ERA5 for non-ASOS stations (HKO).
                 df = await fetch_observed_truth(
                     station.to_location(),
                     station.station_id,
-                    r.target_date, r.target_date,
-                    agg=r.target,
+                    td, td,
+                    agg=tgt,
                     source="metar",
                     client=client,
                 )
             except Exception as exc:
-                print(f"!! fetch {r.station_id} {r.target_date} [{r.target}]: {exc}")
-                return False
+                print(f"!! fetch {sid} {td} [{tgt}]: {exc}")
+                return 0
         if df.empty or pd.isna(df.iloc[0]["observed_c"]):
-            return False
-        r.actual_obs_c = float(df.iloc[0]["observed_c"])
-        r.resolved_at_utc = datetime.now(timezone.utc)
+            return 0
+        actual = float(df.iloc[0]["observed_c"])
+        now = datetime.now(timezone.utc)
 
-        # Cross-check: also fetch Polymarket's actual winning bucket if the
-        # event has closed. Lets us measure the rounding rule + ERA5 gap.
-        winner = await fetch_polymarket_winner(r.event_slug, client)
-        if winner is not None:
-            r.polymarket_won_bucket, r.polymarket_won_threshold = winner
-        return True
+        # Polymarket gamma: one call per unique event slug (deduped within group).
+        unique_slugs = {r.event_slug for r in records_for_key if r.event_slug}
+        winners_by_slug: dict[str, tuple[str, int]] = {}
+        for slug in unique_slugs:
+            w = await fetch_polymarket_winner(slug, client)
+            if w is not None:
+                winners_by_slug[slug] = w
+
+        # Apply to all records in the group
+        for r in records_for_key:
+            r.actual_obs_c = actual
+            r.resolved_at_utc = now
+            if r.event_slug and r.event_slug in winners_by_slug:
+                r.polymarket_won_bucket, r.polymarket_won_threshold = (
+                    winners_by_slug[r.event_slug]
+                )
+        return len(records_for_key)
 
     async with httpx.AsyncClient(timeout=60.0) as client:
-        outcomes = await asyncio.gather(*(resolve_one(r, client) for r in pending))
+        per_group_counts = await asyncio.gather(
+            *(resolve_group(k, rs, client) for k, rs in unique_keys.items())
+        )
 
-    n_resolved = sum(1 for ok in outcomes if ok)
+    n_resolved = sum(per_group_counts)
     if n_resolved:
         write_all_records(records, log_path)
-    print(f"Resolved {n_resolved}/{len(pending)} records.")
+    print(f"Resolved {n_resolved}/{len(pending)} records "
+          f"({len(unique_keys)} unique station-date groups).")
 
 
 if __name__ == "__main__":

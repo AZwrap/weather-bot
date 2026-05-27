@@ -1,4 +1,4 @@
-httpx>=0.27
+httpx[http2]>=0.27  # http2 extra pulls in `h2` for persistent HTTP/2 connections (eliminates ~54ms TLS handshake on every request)
 numpy>=2.0
 pandas>=2.2
 scipy>=1.13

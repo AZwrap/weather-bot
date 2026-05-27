@@ -400,7 +400,7 @@ def _replay_bucket(
             actual_int = _rounded_observation(
                 last_record.actual_obs_c, station.unit
             )
-            won_yes = bucket_won(last_snap, actual_int, station.unit)
+            won_yes = bucket_won(last_snap.kind, last_snap.threshold, actual_int, station.unit)
             won = won_yes if open_pos.side == "YES" else not won_yes
             payoff = open_pos.shares if won else 0.0
             cost_basis = open_pos.entry_price * open_pos.shares
@@ -648,7 +648,7 @@ def _replay_maker_bucket(
             # Held to expiration — settle
             if last_record.actual_obs_c is not None:
                 actual_int = _rounded_observation(last_record.actual_obs_c, station.unit)
-                won_yes = bucket_won(last_snap, actual_int, station.unit)
+                won_yes = bucket_won(last_snap.kind, last_snap.threshold, actual_int, station.unit)
                 won = won_yes if pos.side == "YES" else not won_yes
                 payoff = pos.shares if won else 0.0
                 cost_basis = pos.entry_price * pos.shares
@@ -699,7 +699,7 @@ def _replay_maker_bucket(
             # Settle if resolved
             if last_record.actual_obs_c is not None:
                 actual_int = _rounded_observation(last_record.actual_obs_c, station.unit)
-                won_yes = bucket_won(last_snap, actual_int, station.unit)
+                won_yes = bucket_won(last_snap.kind, last_snap.threshold, actual_int, station.unit)
                 won = won_yes if side == "YES" else not won_yes
                 payoff = shares if won else 0.0
                 cost_basis = taker_fill * shares

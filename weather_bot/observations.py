@@ -123,6 +123,130 @@ async def fetch_metar_daily(
     return df
 
 
+async def fetch_metar_hourly_today(
+    location: Location,
+    icao: str,
+    target_date: date,
+    client: httpx.AsyncClient | None = None,
+) -> pd.DataFrame:
+    """Fetch hourly METAR observations for `target_date` at `icao`.
+
+    Returns DataFrame with columns:
+      - local_dt (pd.Timestamp): observation time in station-local tz
+      - temp_c (float): observed temperature in Celsius
+
+    Used by the intraday METAR-feedback strategy to compute peak-so-far
+    on the resolution day.
+
+    As of Layer 2 (2026-05-17), this uses a multi-source fanout: races
+    NOAA Aviation Weather Center + Iowa State ASOS in parallel and
+    returns whichever responds first with non-empty data. Per-source
+    health is tracked in `data/rate_limit_state.json` (a 429 from one
+    source temporarily routes around it to the other). See
+    `weather_bot/metar_sources.py` for details.
+
+    Returns empty DataFrame on failure.
+    """
+    from weather_bot.metar_sources import fetch_metar_hourly_fanout
+
+    owns = client is None
+    if owns:
+        client = httpx.AsyncClient(timeout=60.0)
+    try:
+        return await fetch_metar_hourly_fanout(
+            client=client,
+            icao=icao,
+            target_date=target_date,
+            tz=location.timezone,
+        )
+    finally:
+        if owns:
+            await client.aclose()
+
+
+async def fetch_metar_hourly_range(
+    location: Location,
+    icao: str,
+    start_date: date,
+    end_date: date,
+    client: httpx.AsyncClient | None = None,
+) -> pd.DataFrame:
+    """Fetch hourly METAR observations between `start_date` and `end_date`
+    (both inclusive) at `icao`.
+
+    Returns DataFrame with columns:
+      - local_dt (pd.Timestamp): observation time in station-local tz
+      - temp_c (float): observed temperature in Celsius
+      - date (date): station-local date (for groupby)
+
+    Used by backtests that need many days of hourly METAR (e.g., the
+    365-day peak-settlement analysis in `backtest_peak_settlement_365.py`).
+    Issuing one query for the whole range is dramatically faster than
+    one-per-day fetching (single Iowa State response vs N round-trips).
+    """
+    end_excl = end_date + timedelta(days=1)
+    params = {
+        "station": icao,
+        "data": "tmpc",
+        "year1": start_date.year, "month1": start_date.month, "day1": start_date.day,
+        "year2": end_excl.year, "month2": end_excl.month, "day2": end_excl.day,
+        "tz": location.timezone,
+        "format": "onlycomma",
+        "latlon": "no",
+        "missing": "null",
+        "trace": "null",
+        "direct": "no",
+    }
+    owns = client is None
+    if owns:
+        client = httpx.AsyncClient(timeout=120.0)
+    backoff = 2.0
+    text: str | None = None
+    try:
+        for attempt in range(5):
+            try:
+                r = await client.get(ASOS_URL, params=params)
+                r.raise_for_status()
+                text = r.text
+                break
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == 429 and attempt < 4:
+                    wait = float(exc.response.headers.get("retry-after", backoff))
+                    await asyncio.sleep(wait)
+                    backoff *= 2
+                    continue
+                return pd.DataFrame(columns=["local_dt", "temp_c", "date"])
+            except Exception:
+                return pd.DataFrame(columns=["local_dt", "temp_c", "date"])
+    finally:
+        if owns:
+            await client.aclose()
+    if not text:
+        return pd.DataFrame(columns=["local_dt", "temp_c", "date"])
+
+    lines = text.splitlines()
+    header_idx = next(
+        (i for i, ln in enumerate(lines) if ln.startswith("station,valid")),
+        None,
+    )
+    if header_idx is None:
+        return pd.DataFrame(columns=["local_dt", "temp_c", "date"])
+
+    raw = pd.read_csv(StringIO("\n".join(lines[header_idx:])))
+    if raw.empty or "tmpc" not in raw.columns:
+        return pd.DataFrame(columns=["local_dt", "temp_c", "date"])
+
+    raw["valid"] = pd.to_datetime(raw["valid"], errors="coerce")
+    raw["tmpc"] = pd.to_numeric(raw["tmpc"], errors="coerce")
+    raw = raw.dropna(subset=["valid", "tmpc"])
+    if raw.empty:
+        return pd.DataFrame(columns=["local_dt", "temp_c", "date"])
+
+    out = raw[["valid", "tmpc"]].rename(columns={"valid": "local_dt", "tmpc": "temp_c"})
+    out["date"] = out["local_dt"].dt.date
+    return out
+
+
 async def fetch_observed_truth(
     location: Location,
     icao: str,

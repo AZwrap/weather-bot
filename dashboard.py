@@ -1,23 +1,35 @@
-"""Streamlit dashboard.
+"""Streamlit dashboard for the live weather bot.
 
-Run locally:
+Run on the VPS under systemd (deploy/weather-bot-dashboard.service)
+or directly for local development:
     streamlit run dashboard.py
 
-Run on the VPS (headless, listening on 8501):
-    streamlit run dashboard.py \
-      --server.port 8501 --server.address 0.0.0.0 --server.headless true
-
-Then open http://VPS_IP:8501 in your browser.
+Access from your laptop via SSH tunnel:
+    ssh -L 8501:localhost:8501 root@VPS_IP
+    # then open http://localhost:8501
 
 Tabs:
-  Overview  — bot health, log volume, last cron, system info
-  Skill     — per-station calibration: MAE / bias / RMSE / CRPS / reliability
-  PnL       — hypothetical P&L from deci-Kelly trades on resolved records
-  Signals   — live scanner output (cached 5 min) with edge/Kelly/size
+  Live trades  — REAL Polymarket positions from data/portfolio.json
+                 (current bankroll, realized PnL, active orders, region
+                 exposure vs caps, recent fills, maker rebates,
+                 cancellations)
+  Overview     — bot health: forward-log volume, last cron tick,
+                 bias_table freshness, per-station record counts
+  Skill        — per-station calibration: MAE / bias / RMSE on resolved
+                 records (feeds bias-table tuning + helps spot stations
+                 drifting away from spec)
+
+History:
+  Earlier versions had P&L (sim), Positions (sim), and Live signals tabs
+  driven by `weather_bot.scanner` (model-driven YES/NO edges). Removed
+  2026-05-14 because (a) that strategy was killed after N=4 backtests
+  showed -$412/day with convergence, and (b) the live bot uses
+  METAR + NO_momentum + cross-up cancel, not model-driven entries.
+  If/when calibration map at N=30 unlocks model-driven entry, re-add
+  via the git history (commit before the cleanup commit).
 """
 from __future__ import annotations
 
-import asyncio
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -34,9 +46,6 @@ from weather_bot.forward_log import (
     ForwardLogRecord,
     load_records,
 )
-from weather_bot.locations import STATIONS_BY_ID
-from weather_bot.positions import Position, replay_maker, summarize
-from weather_bot.scanner import TradeSignal, scan
 
 st.set_page_config(
     page_title="Weather Bot Dashboard",
@@ -77,31 +86,6 @@ def _save_settings(settings: dict) -> None:
 @st.cache_data(ttl=60)
 def cached_records() -> list[ForwardLogRecord]:
     return load_records(DEFAULT_LOG_PATH)
-
-
-@st.cache_data(ttl=300)
-def cached_signals(
-    _bias_path: str, _bankroll: float, _kelly: float, _max_pos: float,
-    _max_edge: float, _min_yes: float, _max_yes: float,
-    _sigma_factor: float, _per_event_cap: float,
-) -> list[TradeSignal]:
-    """Live scan, cached 5 minutes. Underscore-prefixed args = hashable cache keys."""
-    bias_table = BiasTable.load(Path(_bias_path))
-    return asyncio.run(
-        scan(
-            bias_table,
-            min_edge=0.05,
-            max_edge=_max_edge,
-            min_yes_price=_min_yes,
-            max_yes_price=_max_yes,
-            min_volume_24hr=100.0,
-            bankroll_usd=_bankroll,
-            kelly_multiplier=_kelly,
-            max_position_usd=_max_pos,
-            sigma_inflation_factor=_sigma_factor,
-            per_event_cap_usd=_per_event_cap,
-        )
-    )
 
 
 @st.cache_data(ttl=600)
@@ -220,475 +204,347 @@ def render_skill(records: list[ForwardLogRecord]) -> None:
         st.plotly_chart(fig, use_container_width=True)
     else:
         st.caption(f"Need ≥5 resolved records for the scatter plot (have {len(df)}).")
+# ──────────────────────────────────────────────────────────────────────────
+# Live trades tab — real Polymarket positions from data/portfolio.json
+# ──────────────────────────────────────────────────────────────────────────
+
+@st.cache_data(ttl=30)
+def cached_portfolio_raw(path: str, _bust: int = 0) -> dict | None:
+    """Load portfolio.json (raw dict). 30-second cache so the dashboard
+    stays responsive but reflects new fills/resolutions promptly.
+    `_bust` is a manual cache-buster; bump to force a reload."""
+    p = Path(path)
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
 
 
-def render_pnl(
-    records: list[ForwardLogRecord], bankroll: float, kelly: float,
-    max_pos: float, min_edge: float, max_edge: float,
-    min_yes: float, max_yes: float, sigma_factor: float,
-) -> None:
-    eligible = [r for r in records if r.bucket_snapshots is not None]
-    st.subheader("Paper-trade ledger (maker-ladder, deci-Kelly)")
-    if not eligible:
-        st.info("No records with bucket snapshots yet — log_forecasts hasn't run.")
-        return
+def _fetch_live_balance() -> tuple[float | None, str]:
+    """Best-effort fetch of Polymarket Cash balance. Returns (balance, status_msg).
+    Returns (None, msg) if SDK not configured (dry-run mode)."""
+    try:
+        from weather_bot.execution.client import ExecutionClient
+        from weather_bot.execution.safety import TradingConfig
+        cfg = TradingConfig(enabled=False, bankroll_usd=500.0)
+        client = ExecutionClient.from_env(cfg)
+        bal = client.get_balance_usdc()
+        if bal is None:
+            return None, "balance call returned None"
+        return bal, "live"
+    except RuntimeError as exc:
+        return None, f"SDK not configured: {exc}"
+    except Exception as exc:
+        return None, f"error: {exc}"
 
+
+def render_live_trades(portfolio_path: str, starting_bankroll: float) -> None:
+    """Live monitoring view: real positions from data/portfolio.json.
+
+    Sections:
+      [A] Status strip (4 metrics)
+      [B] Cumulative realized PnL over time
+      [C] Active positions (submitted + filled)
+      [D] Per-region exposure with cap utilization
+      [E] Recently resolved trades
+      [F] Daily maker rebates
+      [G] Cancellations / permanent blocks
+    """
+    st.subheader("Live trades — real Polymarket positions")
     st.caption(
-        "📐 **Maker-ladder simulator** — canonical execution strategy. "
-        "Each accepted signal places a 4-rung limit ladder inside the "
-        "bid-ask spread; rungs only fill when the market drifts to our "
-        "price. Unfilled rungs cost $0 (asymmetric payoff). "
-        "Taker-mode simulation is excluded from the dashboard but still "
-        "logged via `pnl.simulate_record` for offline analysis."
+        "Data source: `data/portfolio.json` (persisted by place_orders.py "
+        "and updated by poll_fills/poll_resolutions/sync_maker_rebates crons). "
+        "30s cache — bump the refresh counter to force reload."
     )
 
-    positions = replay_maker(
-        eligible,
-        bankroll_usd=bankroll, kelly_multiplier=kelly,
-        max_position_usd=max_pos, min_edge=min_edge, max_edge=max_edge,
-        min_yes_price=min_yes, max_yes_price=max_yes,
-        sigma_inflation_factor=sigma_factor,
-        taker_fallback=False,
-    )
+    # Refresh control
+    col_refresh, col_bal_btn = st.columns([1, 5])
+    if col_refresh.button("🔄 Refresh"):
+        cached_portfolio_raw.clear()
+        st.rerun()
 
-    if not positions:
-        st.warning(
-            "No maker-ladder fills yet. The forward log needs more snapshot "
-            "density (typically several days of hourly cron) before the "
-            "market drifts through enough rungs to register fills. "
-            "Once the cron runs longer, this tab will populate."
-        )
-        return
-
-    n_pos = len(positions)
-    n_resolved = sum(1 for p in positions if p.closed)
-    n_pending = n_pos - n_resolved
-    n_wins = sum(1 for p in positions if p.closed and p.realized_profit_usd > 0)
-    n_losses = sum(1 for p in positions if p.closed and p.realized_profit_usd < 0)
-    total_exposure = sum(p.position_usd for p in positions)
-    resolved_exposure = sum(p.position_usd for p in positions if p.closed)
-    realized_pnl = sum(p.realized_profit_usd for p in positions if p.closed)
-    win_rate = (n_wins / (n_wins + n_losses)) if (n_wins + n_losses) > 0 else None
-    roi_pct = (realized_pnl / resolved_exposure * 100.0) if resolved_exposure > 0 else None
-
-    cols = st.columns(6)
-    cols[0].metric("Positions", f"{n_pos:,}",
-                   f"{n_pending} pending  ·  {n_resolved} resolved")
-    cols[1].metric("Total exposure", f"${total_exposure:,.0f}")
-    cols[2].metric("Resolved exposure", f"${resolved_exposure:,.0f}")
-    cols[3].metric("Realised P&L", f"${realized_pnl:+,.0f}")
-    cols[4].metric("ROI (resolved)",
-                   f"{roi_pct:+.1f}%" if roi_pct is not None else "—")
-    cols[5].metric("Win rate",
-                   f"{win_rate:.0%}" if win_rate is not None else "—",
-                   f"{n_wins}W / {n_losses}L" if n_resolved else "no resolved yet")
-
-    # Build the position ledger DataFrame
-    def _status(p: Position) -> str:
-        if not p.closed:
-            return "open"
-        last = p.events[-1].action if p.events else ""
-        if last == "sell_take_profit":
-            return "take_profit"
-        if last == "sell_stop_loss":
-            return "stop_loss"
-        if last == "expire":
-            return "won" if p.realized_profit_usd > 0 else "lost"
-        return "closed"
-
-    rows = [{
-        "issue_time_utc": p.open_event.issue_time_utc,
-        "target_date": p.target_date,
-        "station": p.station_id,
-        "target": p.target,
-        "bucket": p.bucket_label,
-        "side": p.side,
-        "entry_price": p.entry_price,
-        "size_usd": p.position_usd,
-        "n_events": len(p.events),
-        "status": _status(p),
-        "profit_usd": p.realized_profit_usd if p.closed else 0.0,
-    } for p in positions]
-    df = pd.DataFrame(rows)
-    df["target_date"] = pd.to_datetime(df["target_date"])
-    df["issue_time_utc"] = pd.to_datetime(df["issue_time_utc"])
-    df = df.sort_values("target_date")
-
-    # Cumulative chart: exposure (gray, includes pending) + P&L (resolved only)
-    closed_statuses = {"won", "lost", "take_profit", "stop_loss"}
-    chart_df = df.copy()
-    chart_df["resolved_profit"] = chart_df["profit_usd"].where(
-        chart_df["status"].isin(closed_statuses), 0.0
-    )
-    daily = chart_df.groupby("target_date").agg(
-        daily_exposure=("size_usd", "sum"),
-        daily_profit=("resolved_profit", "sum"),
-    ).reset_index().sort_values("target_date")
-    daily["cum_exposure"] = daily["daily_exposure"].cumsum()
-    daily["cum_profit"] = daily["daily_profit"].cumsum()
-
-    st.subheader("Cumulative paper exposure & realised P&L")
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=daily["target_date"], y=daily["cum_exposure"],
-        mode="lines", name="Cumulative exposure",
-        line=dict(color="lightgray", width=2),
-        fill="tozeroy",
-    ))
-    fig.add_trace(go.Scatter(
-        x=daily["target_date"], y=daily["cum_profit"],
-        mode="lines+markers", name="Cumulative realised P&L",
-        line=dict(color="#1f8b4c", width=3),
-    ))
-    fig.add_hline(y=0, line_dash="dash", line_color="gray")
-    fig.update_layout(
-        xaxis_title="Target date",
-        yaxis_title="USD",
-        title=f"Bankroll ${bankroll:,.0f}  ·  {kelly:g}× Kelly  ·  cap ${max_pos:.0f}/trade",
-        hovermode="x unified",
-    )
-    st.plotly_chart(fig, use_container_width=True)
-    st.caption(
-        "Gray area = total $ committed across all maker fills (grows as new "
-        "ladder rungs fill). Green line = realised P&L on positions whose "
-        "target day has passed and the METAR observation has been pulled. "
-        "The gap is money 'in flight'."
-    )
-
-    # Status breakdown
-    cnt = df["status"].value_counts()
-    parts = []
-    for status in ("open", "won", "lost", "take_profit", "stop_loss"):
-        if status in cnt and cnt[status] > 0:
-            parts.append(f"{int(cnt[status])} {status}")
-    if parts:
-        st.caption("Status: " + "  ·  ".join(parts))
-
-    # Position ledger table
-    with st.expander(f"Position ledger ({len(df)} rows)", expanded=False):
-        show = df[["issue_time_utc", "target_date", "station", "target", "bucket",
-                   "side", "entry_price", "size_usd", "n_events", "status",
-                   "profit_usd"]].copy()
-        st.dataframe(
-            show.style.format({
-                "entry_price": "{:.3f}",
-                "size_usd": "${:,.2f}",
-                "profit_usd": "${:+,.2f}",
-            }),
-            use_container_width=True, hide_index=True, height=400,
-        )
-
-    # Per-station P&L (only meaningful where there's a resolved position)
-    st.subheader("By station")
-    by_stn = df.groupby("station").agg(
-        positions=("size_usd", "count"),
-        exposure=("size_usd", "sum"),
-        profit=("profit_usd", "sum"),
-    ).reset_index().sort_values("profit", ascending=False)
-    by_stn["resolved_count"] = (
-        df[df["status"].isin(closed_statuses)].groupby("station").size()
-    ).reindex(by_stn["station"]).fillna(0).astype(int).values
-    fig2 = px.bar(by_stn, x="station", y="profit",
-                  hover_data=["positions", "exposure", "resolved_count"],
-                  labels={"profit": "Realised P&L ($)"})
-    st.plotly_chart(fig2, use_container_width=True)
-    st.dataframe(by_stn, use_container_width=True, hide_index=True)
-
-
-def render_positions(
-    records: list[ForwardLogRecord], bankroll: float, kelly: float,
-    max_pos: float, min_edge: float, max_edge: float,
-    min_yes: float, max_yes: float,
-    sigma_factor: float,
-    saved: dict,
-) -> None:
-    st.subheader("Position simulator (multi-snapshot replay)")
-    eligible = [r for r in records if r.bucket_snapshots is not None]
-    if len(eligible) < 2:
+    raw = cached_portfolio_raw(portfolio_path)
+    if raw is None:
         st.info(
-            "Position simulator needs at least 2 snapshots of the same "
-            "(station, target, target_date, bucket) — once hourly cron has "
-            "been firing for a few hours this tab will populate."
+            f"No portfolio data yet at `{portfolio_path}`. This is expected "
+            f"if `place_orders.py --live` hasn't run. Once it has, this tab "
+            f"shows real positions + realized PnL."
         )
         return
 
-    st.caption(
-        f"σ inflation factor (from sidebar) = {sigma_factor:.1f}× — applied "
-        "live: every replay recomputes our_prob from raw_members, so changing "
-        "σ retroactively changes which positions open and close."
+    # Build the same domain objects place_orders/poll_resolutions use, so
+    # the displayed numbers are guaranteed identical to the running bot.
+    from weather_bot.portfolio import (
+        Portfolio, PER_EVENT_CAP_RATIO, PER_REGION_CAP_RATIO,
+        PORTFOLIO_CAP_RATIO, PERMANENT_BLOCK_AFTER_N_CANCELS,
     )
-    st.caption(
-        "**Execution = maker-ladder (canonical).** 4-rung limit ladder inside "
-        "the spread; rungs fill only when the market drifts to our price. "
-        "Taker-mode replay has been removed from the dashboard — it remains "
-        "available in `weather_bot.positions.replay` for offline use."
+    portfolio = Portfolio.load(Path(portfolio_path))
+
+    # ── [A] Status strip ──────────────────────────────────────────────
+    st.markdown("### A. Current state")
+    realized = portfolio.realized_pnl_total()
+    rebates = portfolio.total_maker_rebates()
+    effective = portfolio.effective_bankroll(starting_bankroll)
+    n_open = len(portfolio.open_positions())
+    n_filled = len(portfolio.filled_positions())
+    filled_usd = portfolio.total_exposure_usd()
+
+    cols = st.columns(4)
+    cols[0].metric(
+        "Effective bankroll",
+        f"${effective:,.2f}",
+        f"{(effective - starting_bankroll):+,.2f} vs base ${starting_bankroll:,.0f}",
     )
-    take_profit = st.slider(
-        "Take-profit threshold (EV gap)", 0.0, 0.30,
-        float(saved.get("take_profit", 0.05)), 0.01, key="take_profit",
-        help="Sell when realised EV exceeds hold EV by this much.",
+    cols[1].metric(
+        "Realized PnL",
+        f"${realized:+,.2f}",
+        f"rebates ${rebates:+,.2f}" if rebates else "no rebates yet",
     )
-    stop_loss = st.slider(
-        "Stop-loss: absolute EV floor", -0.50, 0.0,
-        float(saved.get("stop_loss", -0.10)), 0.01, key="stop_loss",
-        help="Sell when hold-EV per share drops below this. "
-             "Effective for mid-priced bets (entry ≈ 0.30–0.70). "
-             "Structurally unreachable for tail bets (entry < |threshold|).",
+    cols[2].metric(
+        "Open positions",
+        f"{n_open}",
+        f"{n_filled} filled · {n_open - n_filled} resting",
     )
-    stop_loss_pct = st.slider(
-        "Stop-loss: relative MTM loss", 0.0, 1.0,
-        float(saved.get("stop_loss_pct", 0.50)), 0.05, key="stop_loss_pct",
-        help="Sell when (entry_price − current_bid) / entry_price exceeds "
-             "this. Catches tail bets where the absolute stop can't fire. "
-             "0.5 = exit when half the position is lost.",
-    )
-    n_rungs = st.slider(
-        "Ladder rungs", 1, 8,
-        int(saved.get("n_rungs", 4)), 1, key="n_rungs",
-        help="Number of evenly-spaced limit orders inside "
-             "the bid-ask spread. Polymarket tick size = 0.001.",
-    )
-
-    # Persist position-tab slider values
-    saved.update({
-        "take_profit": take_profit,
-        "stop_loss": stop_loss,
-        "stop_loss_pct": stop_loss_pct,
-        "n_rungs": n_rungs,
-    })
-
-    positions = replay_maker(
-        eligible,
-        bankroll_usd=bankroll, kelly_multiplier=kelly,
-        max_position_usd=max_pos, min_edge=min_edge, max_edge=max_edge,
-        min_yes_price=min_yes, max_yes_price=max_yes,
-        n_rungs=n_rungs,
-        sigma_inflation_factor=sigma_factor,
-        take_profit_threshold=take_profit,
-        stop_loss_threshold=stop_loss,
-        stop_loss_pct=stop_loss_pct,
-        taker_fallback=False,
-    )
-    summary = summarize(positions)
-
-    cols = st.columns(7)
-    cols[0].metric("Positions opened", f"{summary.n_positions}")
-    cols[1].metric("Open now", f"{summary.n_open}",
-                   f"${summary.open_exposure_usd:,.0f} exposure")
-    cols[2].metric("Take-profit exits", f"{summary.n_take_profit}")
-    cols[3].metric("Stop-loss exits", f"{summary.n_stop_loss}")
-    cols[4].metric("Expired won", f"{summary.n_expire_won}")
-    cols[5].metric("Expired lost", f"{summary.n_expire_lost}")
-    cols[6].metric("Realized P&L", f"${summary.total_realized_pnl_usd:+,.0f}")
-
-    if summary.n_positions == 0:
-        st.warning("No positions opened — try lowering Min edge.")
-        return
-
-    rows = []
-    for p in positions:
-        rows.append({
-            "station": p.station_id,
-            "target": p.target,
-            "target_date": p.target_date,
-            "bucket": p.bucket_label,
-            "side": p.side,
-            "entry_price": p.entry_price,
-            "shares": p.shares,
-            "size_usd": p.position_usd,
-            "n_events": len(p.events),
-            "status": p.status,
-            "realized_pnl": p.realized_profit_usd,
-        })
-    df = pd.DataFrame(rows)
-
-    # Grouping by exit type
-    counts = df["status"].value_counts().reindex(
-        ["open", "sell_take_profit", "sell_stop_loss", "expire"]
-    ).fillna(0).astype(int)
-    fig = go.Figure(data=[go.Bar(
-        x=counts.index, y=counts.values,
-        marker_color=["lightgray", "#1f8b4c", "#d83b01", "#0078d4"],
-    )])
-    fig.update_layout(yaxis_title="positions", title="Position outcomes")
-    st.plotly_chart(fig, use_container_width=True)
-
-    with st.expander(f"Position ledger ({len(df)} positions)", expanded=False):
-        st.dataframe(
-            df.style.format({
-                "entry_price": "{:.3f}",
-                "shares": "{:,.1f}",
-                "size_usd": "${:,.2f}",
-                "realized_pnl": "${:+,.2f}",
-            }),
-            use_container_width=True, hide_index=True, height=400,
+    bal, bal_status = _fetch_live_balance()
+    if bal is not None:
+        expected = starting_bankroll - filled_usd + realized
+        drift = bal - expected
+        cols[3].metric(
+            "Wallet (Polymarket Cash)",
+            f"${bal:,.2f}",
+            f"drift ${drift:+.2f} vs expected" if abs(drift) > 0.01 else "matches",
+            delta_color="off" if abs(drift) < 0.50 else "inverse",
         )
+    else:
+        cols[3].metric("Wallet", "—", bal_status)
 
-    # ─────────────────────────────────────────────────────────────────
-    # Stop-loss sweep — find the SL threshold that maximises realised P&L
-    # ─────────────────────────────────────────────────────────────────
+    # ── [B] Cumulative realized PnL over time ──────────────────────────
     st.divider()
-    st.subheader("Stop-loss sweep")
-    st.caption(
-        "Re-run the simulator across a range of `stop_loss_pct` values to find "
-        "where the realised P&L peaks. The default 0.50 cuts losers early but "
-        "may also cut eventual winners — sweep finds the empirical optimum."
-    )
-    if st.button("🔍 Run stop-loss sweep", key="sl_sweep_run"):
-        sl_values = [round(0.05 * i, 2) for i in range(1, 21)]
-        sweep_rows: list[dict] = []
-        progress = st.progress(0.0, text="Running sweep…")
-        for i, sl in enumerate(sl_values):
-            pos_list = replay_maker(
-                eligible,
-                bankroll_usd=bankroll, kelly_multiplier=kelly,
-                max_position_usd=max_pos, min_edge=min_edge, max_edge=max_edge,
-                min_yes_price=min_yes, max_yes_price=max_yes,
-                n_rungs=n_rungs,
-                take_profit_threshold=take_profit,
-                stop_loss_threshold=stop_loss,
-                stop_loss_pct=sl,
-                sigma_inflation_factor=sigma_factor,
-                taker_fallback=False,
-            )
-            ss = summarize(pos_list)
-            sweep_rows.append({
-                "stop_loss_pct": sl,
-                "n_positions": ss.n_positions,
-                "n_sl_exits": ss.n_stop_loss,
-                "n_tp_exits": ss.n_take_profit,
-                "n_won": ss.n_expire_won,
-                "n_lost": ss.n_expire_lost,
-                "pnl_usd": ss.total_realized_pnl_usd,
-            })
-            progress.progress((i + 1) / len(sl_values),
-                              text=f"sl_pct={sl:.2f} done…")
-        progress.empty()
-
-        df = pd.DataFrame(sweep_rows)
+    st.markdown("### B. Cumulative realized PnL")
+    resolved = [
+        p for p in portfolio.positions
+        if p.status == "resolved" and p.resolved_at is not None
+           and p.realized_pnl is not None
+    ]
+    if len(resolved) < 2:
+        st.caption(f"Need ≥2 resolved positions for a PnL series "
+                   f"(have {len(resolved)}). Will populate as positions resolve.")
+    else:
+        # Per-day aggregation. Include maker rebates as same-day positive.
+        rows = [{
+            "date": p.resolved_at[:10],
+            "pnl": p.realized_pnl,
+            "kind": "resolution",
+        } for p in resolved]
+        for date_iso, amt in portfolio.daily_maker_rebates.items():
+            if amt > 0:
+                rows.append({"date": date_iso, "pnl": amt, "kind": "rebate"})
+        df_pnl = pd.DataFrame(rows)
+        daily = df_pnl.groupby("date")["pnl"].sum().reset_index().sort_values("date")
+        daily["cumulative"] = daily["pnl"].cumsum()
 
         fig = go.Figure()
-        fig.add_trace(go.Scatter(
-            x=df["stop_loss_pct"], y=df["pnl_usd"],
-            mode="lines+markers", name="Realised P&L",
-            line=dict(color="#1f8b4c", width=3),
+        fig.add_trace(go.Bar(
+            x=daily["date"], y=daily["pnl"], name="Daily PnL",
+            marker_color=["green" if v >= 0 else "red" for v in daily["pnl"]],
         ))
-        fig.add_hline(y=0, line_dash="dash", line_color="gray")
+        fig.add_trace(go.Scatter(
+            x=daily["date"], y=daily["cumulative"], name="Cumulative",
+            mode="lines+markers", line=dict(color="blue", width=3),
+            yaxis="y2",
+        ))
         fig.update_layout(
-            xaxis_title="stop_loss_pct (relative MTM exit threshold)",
-            yaxis_title="Realised P&L ($)",
-            hovermode="x unified",
-            title="P&L vs stop-loss threshold (maker-ladder)",
+            xaxis_title="Date (UTC)",
+            yaxis_title="Daily PnL ($)",
+            yaxis2=dict(title="Cumulative ($)", overlaying="y", side="right"),
+            hovermode="x unified", height=400,
         )
         st.plotly_chart(fig, use_container_width=True)
 
-        best = df.loc[df["pnl_usd"].idxmax()]
-        worst = df.loc[df["pnl_usd"].idxmin()]
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Best stop_loss_pct",
-                  f"{best['stop_loss_pct']:.2f}",
-                  f"P&L ${best['pnl_usd']:+,.2f}")
-        c2.metric("Worst stop_loss_pct",
-                  f"{worst['stop_loss_pct']:.2f}",
-                  f"P&L ${worst['pnl_usd']:+,.2f}")
-        c3.metric("Spread",
-                  f"${best['pnl_usd'] - worst['pnl_usd']:+,.2f}",
-                  "value of optimisation")
-
-        with st.expander(f"Sweep table ({len(df)} rows)", expanded=False):
-            st.dataframe(
-                df.style.format({
-                    "stop_loss_pct": "{:.2f}",
-                    "pnl_usd": "${:+,.2f}",
-                }),
-                use_container_width=True, hide_index=True,
-            )
-
-    # Drill-down: pick a position to inspect its event timeline
-    st.subheader("Inspect a position's event timeline")
-    if positions:
-        labels = [
-            f"{i}: {p.station_id} {p.target} {p.target_date} {p.bucket_label} ({p.status})"
-            for i, p in enumerate(positions)
-        ]
-        sel = st.selectbox("Pick a position", labels, index=0)
-        idx = int(sel.split(":")[0])
-        p = positions[idx]
-        ev_rows = [{
-            "step": i + 1,
-            "time": ev.issue_time_utc,
-            "action": ev.action,
-            "fill_price": ev.fill_price,
-            "shares": ev.shares,
-            "cash_flow": ev.cash_flow_usd,
-            "our_prob": ev.our_prob_at_step,
-            "market_mid": ev.market_yes_implied_at_step,
-        } for i, ev in enumerate(p.events)]
+    # ── [C] Active positions (submitted + filled) ──────────────────────
+    st.divider()
+    st.markdown("### C. Active positions")
+    open_pos = portfolio.open_positions()
+    if not open_pos:
+        st.caption("No active positions. Bot is idle (or all trades have resolved).")
+    else:
+        rows = []
+        now = datetime.now(timezone.utc)
+        for p in open_pos:
+            try:
+                age = (now - datetime.fromisoformat(p.submitted_at)).total_seconds() / 3600
+            except (ValueError, TypeError):
+                age = None
+            rows.append({
+                "station": p.station_id,
+                "region": p.region,
+                "date": p.target_date,
+                "side": p.side,
+                "bucket": p.bucket_label,
+                "price": p.entry_price,
+                "shares": p.shares,
+                "usd": p.position_usd,
+                "status": p.status,
+                "strategy": p.strategy,
+                "age_h": age,
+                "order_id": (p.order_id or "")[:14] + ("…" if p.order_id and len(p.order_id) > 14 else ""),
+            })
+        df = pd.DataFrame(rows).sort_values(["status", "date", "station"])
         st.dataframe(
-            pd.DataFrame(ev_rows).style.format({
-                "fill_price": "{:.3f}",
-                "shares": "{:,.1f}",
-                "cash_flow": "${:+,.2f}",
-                "our_prob": "{:.1%}",
-                "market_mid": "{:.1%}",
+            df.style.format({
+                "price": "{:.3f}", "shares": "{:.1f}", "usd": "${:.2f}",
+                "age_h": lambda v: f"{v:.1f}h" if pd.notna(v) else "—",
             }),
             use_container_width=True, hide_index=True,
         )
 
+    # ── [D] Per-region exposure ────────────────────────────────────────
+    st.divider()
+    st.markdown("### D. Region exposure vs caps")
+    caps = portfolio.scaled_caps(starting_bankroll)
+    per_region_cap = caps["per_region_cap"]
+    portfolio_cap = caps["portfolio_cap"]
 
-def render_signals(
-    bias_path: str, bankroll: float, kelly: float, max_pos: float,
-    min_edge: float, max_edge: float, min_yes: float, max_yes: float,
-    min_volume: float, sigma_factor: float, per_event_cap: float,
-) -> None:
-    st.subheader("Live trade signals (5-min cache)")
-    if st.button("🔄 Refresh signals"):
-        cached_signals.clear()  # invalidate
-        st.rerun()              # force re-render so the next call refetches
+    # Build region exposure (filled only — that's what the caps gate)
+    region_exposure: dict[str, float] = {}
+    for p in portfolio.filled_positions():
+        region_exposure[p.region] = region_exposure.get(p.region, 0.0) + p.position_usd
+    if not region_exposure:
+        st.caption(
+            f"No filled exposure yet. Region cap: ${per_region_cap:.2f}, "
+            f"portfolio cap: ${portfolio_cap:.2f} "
+            f"(based on effective bankroll ${effective:,.2f})."
+        )
+    else:
+        regions = sorted(region_exposure.keys())
+        exposures = [region_exposure[r] for r in regions]
+        utilizations = [e / per_region_cap * 100 if per_region_cap > 0 else 0
+                        for e in exposures]
+        fig_r = go.Figure()
+        fig_r.add_trace(go.Bar(
+            x=regions, y=exposures, name="Exposure",
+            marker_color=["red" if u > 100 else ("orange" if u > 75 else "steelblue")
+                          for u in utilizations],
+            text=[f"${e:.0f}<br>({u:.0f}%)" for e, u in zip(exposures, utilizations)],
+            textposition="outside",
+        ))
+        fig_r.add_hline(
+            y=per_region_cap, line_dash="dash", line_color="red",
+            annotation_text=f"Per-region cap ${per_region_cap:.0f}",
+            annotation_position="top right",
+        )
+        fig_r.update_layout(
+            xaxis_title="Region", yaxis_title="Exposure ($, filled positions)",
+            height=380, showlegend=False,
+        )
+        st.plotly_chart(fig_r, use_container_width=True)
+        st.caption(
+            f"Portfolio total: ${filled_usd:,.2f} / ${portfolio_cap:,.2f} = "
+            f"{filled_usd / portfolio_cap * 100 if portfolio_cap > 0 else 0:.0f}% "
+            f"utilization. Caps scale with effective bankroll automatically."
+        )
 
-    cache_key = (bias_path, bankroll, kelly, max_pos, max_edge, min_yes, max_yes,
-                 sigma_factor, per_event_cap)
-    with st.spinner("Scanning Polymarket and fetching forecasts…"):
-        signals = cached_signals(*cache_key)
+    # ── [E] Recently resolved ──────────────────────────────────────────
+    st.divider()
+    st.markdown("### E. Recently resolved (latest 20)")
+    if not resolved:
+        st.caption("No resolved positions yet.")
+    else:
+        # Sort by resolved_at desc, take 20
+        sorted_resolved = sorted(
+            resolved, key=lambda p: p.resolved_at or "", reverse=True
+        )[:20]
+        rows = []
+        for p in sorted_resolved:
+            won = (p.realized_pnl or 0) > 0
+            rows.append({
+                "resolved": (p.resolved_at or "")[:16].replace("T", " "),
+                "station": p.station_id,
+                "date": p.target_date,
+                "side": p.side,
+                "bucket": p.bucket_label,
+                "shares": p.shares,
+                "entry": p.entry_price,
+                "result": "WIN" if won else "LOSS",
+                "pnl": p.realized_pnl,
+            })
+        df_r = pd.DataFrame(rows)
 
-    # Apply user filters
-    signals = [
-        s for s in signals
-        if s.edge >= min_edge and s.volume_24hr >= min_volume
+        # Color-code WIN / LOSS rows
+        def _highlight(row):
+            color = "background-color: #d4edda" if row["result"] == "WIN" else "background-color: #f8d7da"
+            return [color] * len(row)
+
+        st.dataframe(
+            df_r.style.format({
+                "shares": "{:.1f}", "entry": "{:.3f}", "pnl": "${:+,.2f}",
+            }).apply(_highlight, axis=1),
+            use_container_width=True, hide_index=True,
+        )
+
+        # Aggregate WR + ROI
+        n_w = sum(1 for p in resolved if (p.realized_pnl or 0) > 0)
+        n_l = sum(1 for p in resolved if (p.realized_pnl or 0) <= 0)
+        deployed = sum(p.position_usd for p in resolved)
+        wr = n_w / (n_w + n_l) if (n_w + n_l) else 0
+        roi = sum(p.realized_pnl or 0 for p in resolved) / deployed if deployed else 0
+        cols_e = st.columns(4)
+        cols_e[0].metric("Resolved total", f"{len(resolved)}")
+        cols_e[1].metric("Win rate", f"{wr:.0%}", f"{n_w}W / {n_l}L")
+        cols_e[2].metric("Total deployed", f"${deployed:,.2f}")
+        cols_e[3].metric("ROI", f"{roi:+.1%}")
+
+    # ── [F] Daily maker rebates ────────────────────────────────────────
+    st.divider()
+    st.markdown("### F. Daily maker rebates")
+    if not portfolio.daily_maker_rebates:
+        st.caption(
+            "No maker rebates recorded yet. `sync_maker_rebates.py` cron "
+            "runs daily at 00:10 UTC; Polymarket pays at $1 minimum, so "
+            "small days may show $0."
+        )
+    else:
+        rebate_df = pd.DataFrame([
+            {"date": d, "rebate": v}
+            for d, v in sorted(portfolio.daily_maker_rebates.items())
+        ])
+        fig_reb = px.bar(
+            rebate_df, x="date", y="rebate",
+            labels={"rebate": "Rebate ($)", "date": "Date (UTC)"},
+            height=300,
+        )
+        fig_reb.update_layout(showlegend=False)
+        st.plotly_chart(fig_reb, use_container_width=True)
+        st.caption(f"Total maker rebates: ${rebates:+,.2f}")
+
+    # ── [G] Cancellations / blocked ────────────────────────────────────
+    st.divider()
+    st.markdown("### G. Cancellations & blocks")
+    cancelled = [p for p in portfolio.positions if p.status == "cancelled"]
+    blocked = [
+        p for p in cancelled
+        if p.cancellation_count >= PERMANENT_BLOCK_AFTER_N_CANCELS
     ]
-    if not signals:
-        st.warning("No signals match current filters.")
-        return
-
-    rows = [{
-        "rank": i + 1,
-        "station": s.station.name,
-        "target": s.target,
-        "date": str(s.target_date),
-        "bucket": s.bucket_label,
-        "ours": s.our_prob,
-        "market": s.yes_implied,
-        "side": s.side,
-        "fill": s.fill_price,
-        "edge": s.edge,
-        "kelly": s.kelly_full,
-        "size_usd": s.position_usd,
-        "vol24": s.volume_24hr,
-        "sigma_tot": s.sigma_total_c,
-        "bias": s.bias_applied_c,
-    } for i, s in enumerate(signals[:50])]
-    df = pd.DataFrame(rows)
-    st.dataframe(
-        df.style.format({
-            "ours": "{:.1%}", "market": "{:.1%}", "fill": "{:.3f}",
-            "edge": "{:+.1%}", "kelly": "{:.0%}", "size_usd": "${:,.2f}",
-            "vol24": "${:,.0f}", "sigma_tot": "{:.2f}", "bias": "{:+.2f}",
-        }),
-        use_container_width=True, hide_index=True,
-    )
-
-    total_size = sum(s.position_usd for s in signals[:50])
-    st.caption(f"Top 50 signals  ·  total proposed exposure: ${total_size:,.2f}")
+    if not cancelled:
+        st.caption("No cancellations recorded. Bot has had clean execution.")
+    else:
+        st.write(f"Total cancellations: **{len(cancelled)}**  ·  "
+                 f"Permanently blocked: **{len(blocked)}**")
+        rows = [{
+            "cancelled": (p.last_cancelled_at or "")[:16].replace("T", " "),
+            "station": p.station_id,
+            "date": p.target_date,
+            "side": p.side,
+            "bucket": p.bucket_label,
+            "count": p.cancellation_count,
+            "blocked": "YES" if p.cancellation_count >= PERMANENT_BLOCK_AFTER_N_CANCELS else "",
+            "reason": (p.cancellation_reason or "")[:60],
+        } for p in sorted(
+            cancelled, key=lambda p: p.last_cancelled_at or "", reverse=True
+        )[:20]]
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -696,125 +552,139 @@ def render_signals(
 # ──────────────────────────────────────────────────────────────────────────
 
 
+KILL_SWITCH_PATH = Path("KILL_SWITCH")
+
+
+def _kill_switch_active() -> bool:
+    """True if the bot is currently halted via KILL_SWITCH file."""
+    return KILL_SWITCH_PATH.exists()
+
+
+def _kill_switch_mtime() -> str:
+    """Human-readable timestamp of when KILL_SWITCH was last toggled."""
+    if not KILL_SWITCH_PATH.exists():
+        return ""
+    try:
+        ts = datetime.fromtimestamp(
+            KILL_SWITCH_PATH.stat().st_mtime, tz=timezone.utc
+        )
+        return ts.strftime("%Y-%m-%d %H:%M UTC")
+    except OSError:
+        return ""
+
+
+def _toggle_kill_switch(halt: bool) -> tuple[bool, str]:
+    """Create or remove the KILL_SWITCH file.
+    Returns (success, message). Failures usually mean the dashboard
+    process doesn't have write permission to the project root."""
+    try:
+        if halt:
+            KILL_SWITCH_PATH.write_text(
+                f"Halted via dashboard at {datetime.now(timezone.utc).isoformat()}\n",
+                encoding="utf-8",
+            )
+            return True, "Halt request written to KILL_SWITCH file."
+        else:
+            if KILL_SWITCH_PATH.exists():
+                KILL_SWITCH_PATH.unlink()
+            return True, "KILL_SWITCH removed. Live submissions resume on next cron tick."
+    except OSError as exc:
+        return False, f"Filesystem error: {exc}"
+
+
 def main() -> None:
-    st.title("🌤️ Weather Bot Dashboard")
+    st.title("🌤️ Weather Bot — Live Dashboard")
 
     saved = _load_settings()
 
     with st.sidebar:
-        st.header("Sizing")
+        # ── Bot status / kill switch ─────────────────────────────────
+        # Highest-priority sidebar element — always visible regardless
+        # of which tab is open. Toggles the same KILL_SWITCH file that
+        # intraday_scan.py checks at the start of every cron tick.
+        st.header("🔌 Bot status")
+        halted = _kill_switch_active()
+        if halted:
+            st.error(
+                "🛑 **HALTED**\n\n"
+                "Live submissions are disabled. Existing positions are "
+                "untouched; paper logging continues. Next cron tick will "
+                "see the KILL_SWITCH file and skip live submission."
+            )
+            mtime = _kill_switch_mtime()
+            if mtime:
+                st.caption(f"Halted at: {mtime}")
+            if st.button(
+                "▶️ Resume live trading", type="primary",
+                use_container_width=True, key="resume_btn",
+            ):
+                ok, msg = _toggle_kill_switch(halt=False)
+                if ok:
+                    st.success(msg)
+                    st.rerun()
+                else:
+                    st.error(msg)
+        else:
+            st.success(
+                "🟢 **LIVE**\n\n"
+                "Submissions enabled. Cron fires at :01, :16, :31, :46 UTC."
+            )
+            if st.button(
+                "🛑 Halt bot", type="secondary",
+                use_container_width=True, key="halt_btn",
+                help="Creates the KILL_SWITCH file. Next intraday_scan tick "
+                     "will skip live submissions (paper logging continues). "
+                     "One click — re-enable by clicking Resume.",
+            ):
+                ok, msg = _toggle_kill_switch(halt=True)
+                if ok:
+                    st.warning(msg)
+                    st.rerun()
+                else:
+                    st.error(msg)
+
+        st.divider()
+        st.header("Bankroll")
         bankroll = st.number_input(
-            "Bankroll ($)", value=float(saved.get("bankroll", 1000.0)),
+            "Starting bankroll ($)", value=float(saved.get("bankroll", 500.0)),
             step=100.0, min_value=10.0, key="bankroll",
+            help="Production setting: $500. Used by the Live Trades tab "
+                 "as the floor for adaptive-cap math: effective bankroll "
+                 "= starting + realized PnL, capped at $2k ceiling. "
+                 "Should match TradingConfig.bankroll_usd on the bot.",
         )
-        kelly = st.number_input(
-            "Kelly multiplier", value=float(saved.get("kelly", 0.1)),
-            step=0.05, min_value=0.0, max_value=1.0, key="kelly",
-            help="0.1 = deci-Kelly. Don't raise without forward-log validation.",
-        )
-        max_pos = st.number_input(
-            "Max position ($)", value=float(saved.get("max_pos", 50.0)),
-            step=10.0, min_value=1.0, key="max_pos",
-        )
-        per_event_cap = st.number_input(
-            "Per-event cap ($)", value=float(saved.get("per_event_cap", 30.0)),
-            step=10.0, min_value=0.0, key="per_event_cap",
-            help="Max exposure across all buckets of a single (station, target, "
-                 "date) event. Prevents Wellington-style over-concentration.",
-        )
-        daily_cap = st.number_input(
-            "Daily exposure cap ($)", value=float(saved.get("daily_cap", 0.0)),
-            step=25.0, min_value=0.0, key="daily_cap",
-            help="0 = no cap (paper-trade research mode). Set >0 to preview "
-                 "the live execution cap from TradingConfig.",
-        )
-
-        st.header("Filters")
-        min_edge = st.slider(
-            "Min edge", 0.0, 0.5, float(saved.get("min_edge", 0.05)), 0.01,
-            key="min_edge",
-        )
-        max_edge = st.slider(
-            "Max edge", 0.05, 1.0, float(saved.get("max_edge", 0.25)), 0.05,
-            key="max_edge",
-            help="Drop signals with edge above this — large edges (>25%) "
-                 "almost always indicate model error at the tails.",
-        )
-        min_yes = st.slider(
-            "Min fill price", 0.0, 0.5, float(saved.get("min_yes", 0.05)), 0.01,
-            key="min_yes",
-            help="Skips trades where the price we'd PAY (yes_ask for YES, "
-                 "1−yes_bid for NO) is below this. Filters out extreme-tail "
-                 "markets where bid/ask is unreliable. Symmetric across both sides.",
-        )
-        max_yes = st.slider(
-            "Max fill price", 0.5, 1.0, float(saved.get("max_yes", 0.95)), 0.01,
-            key="max_yes",
-            help="Skips trades where the price we'd PAY is above this. "
-                 "Symmetric across both YES and NO sides.",
-        )
-        min_volume = st.number_input(
-            "Min 24h volume ($)", value=float(saved.get("min_volume", 100.0)),
-            step=100.0, min_value=0.0, key="min_volume",
-        )
-
-        st.header("Calibration")
-        sigma_factor = st.slider(
-            "σ inflation factor", 1.0, 2.5, float(saved.get("sigma_factor", 1.4)), 0.1,
-            key="sigma_factor",
-            help="Multiplies σ_residual to widen the predictive distribution. "
-                 "1.0 = use BiasTable σ as-is (likely under-estimates "
-                 "real 1-day-lead error). Default 1.4 is paranoid until "
-                 "forward-log calibrates the true factor.",
+        st.caption(
+            "Caps derived live (see Live Trades → Region exposure):\n"
+            "- Portfolio cap = 80% of effective bankroll\n"
+            "- Per-region cap = 20%\n"
+            "- Per-event cap = 11%"
         )
 
         st.divider()
+        st.header("Paths")
         bias_path = st.text_input(
             "bias_table.json path",
             value=saved.get("bias_path", "bias_table.json"),
             key="bias_path",
+            help="Used by the Overview tab to show bias-table freshness.",
         )
 
-    # Merge current sidebar values into `saved` so (a) render_positions
-    # sees the live values, and (b) the final save below has the full set.
-    # Critical: do NOT _save_settings() yet — render_positions may add
-    # position-tab keys to `saved`, and we want a single canonical write
-    # at the end. (Earlier code did a save here AND a save after tabs;
-    # the second one clobbered the first with stale `saved` keys.)
-    saved.update({
-        "bankroll": bankroll, "kelly": kelly, "max_pos": max_pos,
-        "per_event_cap": per_event_cap, "daily_cap": daily_cap,
-        "min_edge": min_edge, "max_edge": max_edge,
-        "min_yes": min_yes, "max_yes": max_yes,
-        "min_volume": min_volume, "sigma_factor": sigma_factor,
-        "bias_path": bias_path,
-    })
+    # Persist just the two settings we still expose
+    saved.update({"bankroll": bankroll, "bias_path": bias_path})
+    _save_settings(saved)
 
     records = cached_records()
     bias_meta = cached_bias_table_meta(bias_path)
 
-    tab_o, tab_s, tab_p, tab_pos, tab_sig = st.tabs(
-        ["Overview", "Skill", "P&L", "Positions", "Live signals"]
+    tab_live, tab_o, tab_s = st.tabs(
+        ["🔴 Live trades", "Overview", "Skill"]
     )
+    with tab_live:
+        render_live_trades("data/portfolio.json", bankroll)
     with tab_o:
         render_overview(records, bias_meta)
     with tab_s:
         render_skill(records)
-    with tab_p:
-        render_pnl(records, bankroll, kelly, max_pos, min_edge, max_edge,
-                   min_yes, max_yes, sigma_factor)
-    with tab_pos:
-        render_positions(records, bankroll, kelly, max_pos, min_edge,
-                         max_edge, min_yes, max_yes, sigma_factor, saved)
-    # Single canonical save: includes both sidebar values (merged above)
-    # and any position-tab keys that render_positions added to `saved`.
-    _save_settings(saved)
-    with tab_sig:
-        render_signals(
-            bias_path, bankroll, kelly, max_pos,
-            min_edge, max_edge, min_yes, max_yes, min_volume,
-            sigma_factor, per_event_cap,
-        )
 
 
 if __name__ == "__main__":

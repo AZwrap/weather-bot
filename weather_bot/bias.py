@@ -94,10 +94,13 @@ class BiasTable:
         return len(self.entries)
 
     def save(self, path: Path) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps([e.as_jsonable() for e in self.entries.values()], indent=2)
-        )
+        """Atomic save via weather_bot.atomic_write — bias_table.json is
+        read at the start of every scan; a non-atomic write left a
+        concurrency window where the weekly retrain cron could corrupt
+        the file mid-write, causing scan_markets / place_orders to load
+        partial JSON and skew probability calibration."""
+        from weather_bot.atomic_write import atomic_write_json
+        atomic_write_json(path, [e.as_jsonable() for e in self.entries.values()])
 
     @classmethod
     def load(cls, path: Path) -> "BiasTable":

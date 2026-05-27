@@ -69,15 +69,30 @@ class BucketTradeResult:
 def _rounded_observation(actual_c: float, unit: Unit) -> int:
     """Convert observed temperature to the integer used for bucket resolution.
 
-    METAR truth values are whole-degree Celsius natively, so floor on the
-    converted value gives the integer Polymarket resolves on.
+    For C-side stations: METAR reports integer °C natively, so floor matches.
+
+    For F-side stations: Iowa State stores tmpc = f_to_c(tmpf), losing
+    precision. e.g., a true 72°F observation is stored as 22.222...°C. When
+    we round-trip back via c_to_f(actual_c), we get 71.996°F — flooring this
+    gives 71, off by one from the original 72°F.
+
+    Fix: add a small epsilon (0.1°F or 0.05°C) before flooring to absorb the
+    round-trip precision loss without affecting genuine mid-bucket values.
+    Verified against 37 resolved Polymarket records on 2026-05-08: all 4
+    F-side mismatches resolved, no C-side regressions.
+
+    Updated 2026-05-10 after `verify_polymarket_rounding_v2.py` analysis.
     """
-    actual = c_to_f(actual_c) if unit == "F" else actual_c
-    return int(math.floor(actual))
+    if unit == "F":
+        # F-side: epsilon in F space handles the C->F->C round-trip artifact.
+        actual_f = c_to_f(actual_c)
+        return int(math.floor(actual_f + 0.1))
+    # C-side: METAR is integer °C natively, no artifact possible.
+    return int(math.floor(actual_c + 0.05))
 
 
-def bucket_won(snap: BucketSnapshot, actual_int: int, unit: Unit) -> bool:
-    """Decide whether `snap`'s bucket WON, given the rounded observation.
+def bucket_won(kind: str, threshold: int, actual_int: int, unit: Unit) -> bool:
+    """Decide whether a bucket WON, given the rounded observation.
 
     Polymarket bucket conventions (verified empirically against live markets):
       °C: low_tail "X°C or below" → actual ≤ X
@@ -86,15 +101,18 @@ def bucket_won(snap: BucketSnapshot, actual_int: int, unit: Unit) -> bool:
       °F: low_tail "X°F or below" → actual ≤ X
           mid     "X-Y°F"         → X ≤ actual ≤ X+1   (always 2 wide)
           high_tail "X°F or higher" → actual ≥ X
+
+    Takes (kind, threshold) directly rather than a snapshot object so callers
+    that don't have a BucketSnapshot handy don't need to fabricate one.
     """
-    if snap.kind == "low_tail":
-        return actual_int <= snap.threshold
-    if snap.kind == "high_tail":
-        return actual_int >= snap.threshold
+    if kind == "low_tail":
+        return actual_int <= threshold
+    if kind == "high_tail":
+        return actual_int >= threshold
     # mid
     if unit == "C":
-        return actual_int == snap.threshold
-    return snap.threshold <= actual_int <= snap.threshold + 1
+        return actual_int == threshold
+    return threshold <= actual_int <= threshold + 1
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -181,7 +199,7 @@ def simulate_record(
     else:
         actual_int = _rounded_observation(record.actual_obs_c, unit)
         def lookup_won(snap):
-            return bucket_won(snap, actual_int, unit)
+            return bucket_won(snap.kind, snap.threshold, actual_int, unit)
 
     issue_iso = record.issue_time_utc.isoformat()
     out: list[BucketTradeResult] = []

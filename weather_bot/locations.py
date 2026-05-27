@@ -109,7 +109,11 @@ STATIONS_BY_ID: dict[str, Station] = {
         # The `resolutionSource` URL points at OPKC (Jinnah Intl). The two
         # stations are ~30 km apart. UMA resolvers read the description first,
         # so OPMR is the resolving station; the URL is a misconfigured link.
-        # Verify on the live UI before sizing up any Karachi position.
+        # Excluded from MARKETS below (2026-05-11): Iowa State ASOS does not
+        # publish OPMR/OPKC data on a usable schedule — observed 100% of
+        # records pending on May 8/9/10 2026. Without a truth source we
+        # cannot calibrate, so we don't trade Karachi. Registry entry kept
+        # for historical record interpretation.
         Station("Karachi",       "OPMR", "Masroor Airbase",                         24.8936,   66.9388, "Asia/Karachi",     "C"),
         Station("Tel Aviv",      "LLBG", "Ben Gurion International Airport",        32.0114,   34.8866, "Asia/Jerusalem",   "C"),
         Station("Jeddah",        "OEJN", "King Abdulaziz International Airport",    21.6797,   39.1565, "Asia/Riyadh",      "C"),
@@ -179,7 +183,6 @@ MARKETS: list[tuple[str, MarketTarget]] = [
     ("KAUS", "highest"),  # Austin
     ("ZSPD", "lowest"),   # Shanghai
     ("KLGA", "lowest"),   # NYC
-    ("OPMR", "highest"),  # Karachi (description says Masroor; URL says OPKC — see Station note)
     ("KMIA", "lowest"),   # Miami
     ("RPLL", "highest"),  # Manila
     ("EHAM", "highest"),  # Amsterdam

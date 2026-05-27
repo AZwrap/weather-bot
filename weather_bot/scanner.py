@@ -14,8 +14,11 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from datetime import date, datetime, timezone as tz
-from typing import Literal
+from datetime import date, datetime, timedelta, timezone as tz
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    from .portfolio import Portfolio
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -35,7 +38,7 @@ from .polymarket import (
     match_event_to_station,
     parse_bucket,
 )
-from .sizing import position_size_usd, kelly_fraction
+from .sizing import dynamic_kelly_multiplier, kelly_fraction, position_size_usd
 from .units import Unit
 
 Side = Literal["YES", "NO"]
@@ -53,7 +56,7 @@ class TradeSignal:
     market_id: int
     token_id: str                # the side we'd buy
     our_prob: float
-    yes_implied: float           # market's mid yes-probability
+    yes_implied: float | None    # market's mid yes-probability; None if no bid/ask/last available (distinguish from "actually 0%")
     yes_bid: float | None
     yes_ask: float | None
     side: Side                   # "YES" or "NO" — which side has positive edge
@@ -65,6 +68,15 @@ class TradeSignal:
     sigma_total_c: float         # σ after combining ensemble + residual variance
     kelly_full: float            # full-Kelly fraction (0..1)
     position_usd: float          # USD size after fractional-Kelly sizing
+
+    # Dynamic Kelly stage-3 multiplier applied on top of base kelly_multiplier
+    # (added 2026-05-13). 1.0 = no scaling (legacy behaviour). Lower = closer
+    # to a long-horizon / wide-ensemble situation that should size down.
+    # Logged per-trade so post-hoc analysis can verify high-multiplier trades
+    # outperform low-multiplier ones (the validation gate per
+    # project_pricing_engine.md Stage 3).
+    dynamic_kelly_mult: float = 1.0
+    hours_to_resolution: float | None = None
 
     @property
     def score(self) -> float:
@@ -162,6 +174,7 @@ async def scan(
     liquidity_cap_fraction: float = 0.1,
     per_event_cap_usd: float = 0.0,
     use_clob_prices: bool = True,
+    portfolio: "Portfolio | None" = None,  # added 2026-05-14
 ) -> list[TradeSignal]:
     """Scan every Polymarket weather event and return ranked trade signals.
 
@@ -287,12 +300,43 @@ async def scan(
                     continue
 
                 kf = kelly_fraction(our_prob, fill_price, side)
+
+                # Portfolio-Kelly multiplier (added 2026-05-14): scales
+                # down by correlation with currently-open positions.
+                # 1.0 when portfolio is None or empty.
+                if portfolio is not None:
+                    portfolio_mult = portfolio.portfolio_kelly_multiplier(
+                        station_id=station.station_id,
+                        market_id=m.market_id,
+                        bankroll_usd=bankroll_usd,
+                    )
+                else:
+                    portfolio_mult = 1.0
+
+                # Dynamic Kelly stage-3 inputs.
+                # Resolution moment = midnight local AT END of target_date,
+                # i.e. start of (target_date + 1) in station timezone.
+                resolution_local = datetime(
+                    target_date.year, target_date.month, target_date.day,
+                    0, 0, 0, tzinfo=ZoneInfo(station.timezone),
+                ) + timedelta(days=1)
+                resolution_utc = resolution_local.astimezone(tz.utc)
+                hrs_to_res = max(
+                    0.0, (resolution_utc - now_utc).total_seconds() / 3600.0
+                )
+                dyn_mult = dynamic_kelly_multiplier(hrs_to_res, sigma_total)
+                # Compose portfolio_mult into the kelly_multiplier so size
+                # is scaled down by correlation with already-open positions
+                # alongside the base deci-Kelly + dynamic Kelly factors.
+                effective_kelly_mult = kelly_multiplier * portfolio_mult
                 pos_usd = position_size_usd(
                     our_prob, fill_price, side,
                     bankroll_usd=bankroll_usd,
-                    kelly_multiplier=kelly_multiplier,
+                    kelly_multiplier=effective_kelly_mult,
                     max_position_usd=max_position_usd,
                     liquidity_cap_usd=m.volume_24hr * liquidity_cap_fraction,
+                    hours_to_resolution=hrs_to_res,
+                    sigma_total_c=sigma_total,
                 )
 
                 event_signals.append(
@@ -307,7 +351,7 @@ async def scan(
                         market_id=m.market_id,
                         token_id=m.yes_token_id if side == "YES" else m.no_token_id,
                         our_prob=our_prob,
-                        yes_implied=float(m.yes_implied) if m.yes_implied is not None else 0.0,
+                        yes_implied=float(m.yes_implied) if m.yes_implied is not None else None,
                         yes_bid=m.yes_bid,
                         yes_ask=m.yes_ask,
                         side=side,
@@ -319,6 +363,8 @@ async def scan(
                         sigma_total_c=sigma_total,
                         kelly_full=kf,
                         position_usd=pos_usd,
+                        dynamic_kelly_mult=dyn_mult,
+                        hours_to_resolution=hrs_to_res,
                     )
                 )
 

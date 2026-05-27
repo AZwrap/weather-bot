@@ -48,6 +48,32 @@ class BucketSnapshot:
     yes_token_id: str
     no_token_id: str
 
+    # Top-of-book depth (added 2026-05-13 for live-fill realism modelling).
+    # Captured from CLOB /book at scan time so we can recalibrate the
+    # `--depth-aware-metar` synthetic ladder (top_shares default 10) once
+    # N≥7 days of paper-scan data accumulate. None on records issued
+    # before this field was added; depth-aware code must fall back to
+    # the synthetic model in that case.
+    top_yes_ask_size: float | None = None    # shares at best ask (YES side)
+    top_yes_bid_size: float | None = None    # shares at best bid (YES side)
+
+    # Full 5-level depth ladder + per-market tick size (added 2026-05-13).
+    # Each level is [price, shares]. Lists are sorted best-first:
+    #   yes_ask_levels[0] = lowest ask (best for buyer)
+    #   yes_bid_levels[0] = highest bid (best for seller)
+    # Up to 5 levels per side; fewer if the book is thinner. Empty list
+    # means the side is empty on the book. None means depth wasn't
+    # captured for this snapshot (tomorrow's events; pre-2026-05-13
+    # records; depth fetch failed).
+    #
+    # tick_size: Polymarket markets use varying tick sizes
+    # (0.001, 0.01, 0.0001, 0.1). Captured per-market so live maker
+    # placement uses the right increment instead of the hardcoded
+    # POLYMARKET_DEFAULT_TICK_SIZE.
+    yes_ask_levels: list[list[float]] | None = None   # top 5 [price, shares]
+    yes_bid_levels: list[list[float]] | None = None   # top 5 [price, shares]
+    tick_size: float | None = None
+
     def to_jsonable(self) -> dict:
         return asdict(self)
 
@@ -65,7 +91,33 @@ class BucketSnapshot:
             market_id=int(d["market_id"]),
             yes_token_id=str(d["yes_token_id"]),
             no_token_id=str(d["no_token_id"]),
+            top_yes_ask_size=(float(d["top_yes_ask_size"])
+                              if d.get("top_yes_ask_size") is not None else None),
+            top_yes_bid_size=(float(d["top_yes_bid_size"])
+                              if d.get("top_yes_bid_size") is not None else None),
+            yes_ask_levels=_parse_levels(d.get("yes_ask_levels")),
+            yes_bid_levels=_parse_levels(d.get("yes_bid_levels")),
+            tick_size=(float(d["tick_size"]) if d.get("tick_size") is not None else None),
         )
+
+
+def _parse_levels(raw) -> list[list[float]] | None:
+    """Parse a saved `yes_ask_levels` / `yes_bid_levels` value back to
+    list[list[float]]. Tolerates legacy None / missing-key shape, and
+    coerces JSON's list[list[Any]] back to floats."""
+    if raw is None:
+        return None
+    if not isinstance(raw, list):
+        return None
+    out: list[list[float]] = []
+    for lv in raw:
+        if not isinstance(lv, (list, tuple)) or len(lv) < 2:
+            continue
+        try:
+            out.append([float(lv[0]), float(lv[1])])
+        except (TypeError, ValueError):
+            continue
+    return out
 
 
 @dataclass
@@ -107,6 +159,27 @@ class ForwardLogRecord:
     polymarket_won_bucket: str | None = None
     polymarket_won_threshold: int | None = None
 
+    # Deterministic multi-model forecasts for THIS record's target_date,
+    # from non-ECMWF-ensemble models. Logged alongside the ECMWF ensemble
+    # for future bias retraining. Each value is the deterministic prediction
+    # for the record's `target` (max or min) field.
+    # e.g. {"icon_seamless": 24.5, "gem_seamless": 24.2, "gfs_seamless": 25.1}
+    # Added 2026-05-10 (Option B from project_pricing_engine.md).
+    # Backward-compat: None for records logged before this change.
+    multimodel_forecasts_c: dict[str, float] | None = None
+
+    # ECMWF model initialisation time for the run that produced
+    # `raw_members_c`. ECMWF runs at 00/06/12/18 UTC and is typically
+    # available ~4-5h after init. We don't fetch multiple runs explicitly
+    # (would 4× our API budget); instead the 20-min cron naturally cycles
+    # through whatever run is most recent at each fetch. This field tags
+    # each record with which run it came from so analysis can pick
+    # lead-time-conditional bias estimates etc.
+    # Derived from issue_time_utc — same value would be recoverable from
+    # any record without this field, but materialising it here saves
+    # repeated computation. Added 2026-05-10.
+    ecmwf_run_init_utc: datetime | None = None
+
     @property
     def is_resolved(self) -> bool:
         return self.actual_obs_c is not None
@@ -137,6 +210,9 @@ class ForwardLogRecord:
         d["target_date"] = self.target_date.isoformat()
         d["resolved_at_utc"] = (
             self.resolved_at_utc.isoformat() if self.resolved_at_utc else None
+        )
+        d["ecmwf_run_init_utc"] = (
+            self.ecmwf_run_init_utc.isoformat() if self.ecmwf_run_init_utc else None
         )
         # bucket_snapshots is already serialised by asdict()
         return d
@@ -178,6 +254,16 @@ class ForwardLogRecord:
             polymarket_won_threshold=(
                 int(d["polymarket_won_threshold"])
                 if d.get("polymarket_won_threshold") is not None
+                else None
+            ),
+            multimodel_forecasts_c=(
+                {str(k): float(v) for k, v in d["multimodel_forecasts_c"].items()}
+                if d.get("multimodel_forecasts_c")
+                else None
+            ),
+            ecmwf_run_init_utc=(
+                datetime.fromisoformat(d["ecmwf_run_init_utc"])
+                if d.get("ecmwf_run_init_utc")
                 else None
             ),
         )
@@ -241,3 +327,40 @@ def existing_keys_hourly(
         )
         for r in records
     }
+
+
+def existing_keys_slot(
+    records: list[ForwardLogRecord],
+    slot_minutes: int = 20,
+) -> set[tuple[str, str, date, str]]:
+    """Set of (station_id, target, target_date, slot_id) for finer-grain
+    dedup matching a sub-hourly cron schedule.
+
+    `slot_minutes=20` matches the `*/20 * * * *` cron, allowing 3 snapshots
+    per hour per (station, target, target_date). Slot id is the issue
+    time UTC rounded DOWN to the nearest slot_minutes boundary, formatted
+    as YYYYMMDDHHMM. So 00:00, 00:20, 00:40 all hash to distinct slot ids.
+
+    Use this when cron cadence is finer than 1 hour. Older records logged
+    under the hourly dedup will hash to slot "HHMM=HH00" and don't conflict
+    with new sub-hour slots.
+
+    Added 2026-05-10.
+    """
+    def _slot_id(dt: datetime) -> str:
+        utc = dt.astimezone(timezone.utc)
+        slot_min = (utc.minute // slot_minutes) * slot_minutes
+        return utc.replace(minute=slot_min, second=0, microsecond=0).strftime("%Y%m%d%H%M")
+    return {
+        (r.station_id, r.target, r.target_date, _slot_id(r.issue_time_utc))
+        for r in records
+    }
+
+
+def slot_id_for(now_utc: datetime, slot_minutes: int = 20) -> str:
+    """Slot identifier for a given timestamp. Mirrors `existing_keys_slot`
+    so log_forecasts can compute the slot id it's about to write under
+    and check membership in the existing-keys set."""
+    utc = now_utc.astimezone(timezone.utc)
+    slot_min = (utc.minute // slot_minutes) * slot_minutes
+    return utc.replace(minute=slot_min, second=0, microsecond=0).strftime("%Y%m%d%H%M")

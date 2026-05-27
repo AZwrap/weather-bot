@@ -1,0 +1,26 @@
+[
+  {
+    "station_id": "DNMM",
+    "target": "*",
+    "expires": "2027-01-01",
+    "reason": "ORACLE-SOURCE-AMBIGUITY: 2026-05-12 saw a 3-way disagreement on the daily peak \u2014 Wunderground main page reported 91\u00b0F (32.8\u00b0C), ASOS METAR reported 39\u00b0C (102\u00b0F), Polymarket resolution oracle picked 37\u00b0C+ (98.6\u00b0F+). All three sources differ by up to 6\u00b0C. Polymarket comment thread confirms multiple users call Lagos resolutions 'a gamble'. Until the resolution-oracle source can be reliably identified and our forecast pipeline aligned with it, treat DNMM as untradeable for live money. Paper analysis continues (METAR FP rate, backtests). Re-evaluate at 2027-01-01 or sooner if a clear oracle source is documented."
+  },
+  {
+    "station_id": "ZGSZ",
+    "target": "*",
+    "expires": "2027-01-01",
+    "reason": "ASOS-DATA-QUALITY (user-verified 2026-05-14 against Wunderground): May 9-13 2026 our Iowa State ASOS feed for Shenzhen Bao'an consistently disagrees with both Wunderground AND Polymarket (which agree). May 9: ASOS=27, WG=76\u00b0F=24.4\u00b0C, Polymarket=25. May 10: ASOS=26, WG=81\u00b0F=27.2\u00b0C, Polymarket=27. May 12: ASOS=29, WG=87\u00b0F=30.6\u00b0C, Polymarket=30. May 13: ASOS=30, WG=92\u00b0F=33.3\u00b0C, Polymarket=33+. Errors mixed direction (1-3\u00b0C) \u2014 not a systematic bias, suggests ASOS sensor at ZGSZ is intermittent or pulls from a different microclimate than the rest of the airport. Polymarket oracle is CORRECT; our data layer is unreliable. To re-enable: switch to Wunderground PWS API or alternate METAR feed for Shenzhen, then re-validate at N=5 days."
+  },
+  {
+    "station_id": "WIHH",
+    "target": "*",
+    "expires": "2027-01-01",
+    "reason": "REMOVED-BY-POLYMARKET (user-verified 2026-05-21 against Polymarket UI): Polymarket no longer publishes weather markets for Jakarta. The bot's match_event_to_station won't find events for this station anyway, but adding to exclusion list as belt-and-suspenders in case Polymarket re-adds with a different format. Re-evaluate when Polymarket publishes Jakarta markets again with confirmed-correct station identification."
+  },
+  {
+    "station_id": "ZSQD",
+    "target": "*",
+    "expires": "2027-01-01",
+    "reason": "REMOVED-BY-POLYMARKET (user-verified 2026-05-21 against Polymarket UI): Polymarket no longer publishes weather markets for Qingdao. The bot's match_event_to_station won't find events for this station anyway, but adding to exclusion list as belt-and-suspenders in case Polymarket re-adds with a different format. Re-evaluate when Polymarket publishes Qingdao markets again with confirmed-correct station identification."
+  }
+]
