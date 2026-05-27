@@ -188,8 +188,9 @@ def submit_v2_conditional_preposit_orders(
         return {"reason": "drawdown_breaker", "detail": reason}
 
     counts: dict[str, int] = defaultdict(int)
-    from weather_bot.no_momentum import _load_excluded_stations
-    excluded = _load_excluded_stations()
+    from weather_bot.exclusions import load_active_exclusions
+    excluded_pairs = load_active_exclusions(datetime.now(timezone.utc).date())
+    excluded = {sid for sid, _target in excluded_pairs}
     bankroll = float(getattr(client.config, "bankroll_usd", 500.0))
     daily_limit = float(getattr(client.config, "daily_deployment_limit_usd", 150.0))
     scaled_caps = portfolio.scaled_caps(bankroll)
@@ -233,29 +234,12 @@ def submit_v2_conditional_preposit_orders(
             counts["skipped_gate_not_met"] += 1
             continue
 
-        # ── Layer 6 adverse-info window (per-event check, same as NO_momentum)
-        from weather_bot.time_of_day_filter import (
-            is_adverse_info_window,
-            log_time_of_day_decision,
-        )
-        in_adv_window, hrs_to_peak, peak_local_h = is_adverse_info_window(
-            station_id=station.station_id,
-            target=target,
-            now_utc=datetime.now(timezone.utc),
-            target_date=target_date,
-        )
-        if in_adv_window:
-            counts["skipped_adverse_window"] += 1
-            log_time_of_day_decision(
-                station_id=station.station_id, target=target,
-                target_date_iso=target_date.isoformat(),
-                bucket_label=f"<v2 all candidates>",
-                n_buckets_skipped=1,
-                decision="skipped", in_window=True,
-                hours_to_peak=hrs_to_peak,
-                peak_local_hour=peak_local_h,
-            )
-            continue
+        # Layer 6 adverse-info window check was REMOVED in the lite
+        # rebuild — it depended on the peak-based intraday tuning we
+        # deleted, and V2 stays paper-only (V2_ENABLED=False) until
+        # N≥30 paper resolutions validate the strategy. Before flipping
+        # V2 to live, re-add a defensive filter to avoid placing makers
+        # too close to peak hours (adverse-selection mitigation).
 
         # ── Per-bucket loop. Skip the gate bucket itself (we don't
         # bet NO against the bucket that's converging to win).
