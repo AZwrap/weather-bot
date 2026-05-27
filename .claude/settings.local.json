@@ -39,7 +39,22 @@
       "Bash(grep -r \"rsync\" --include=\"*.sh\" --include=\"*.md\" --include=\"*.txt\" -l)",
       "Bash(.venv/Scripts/python.exe -c \"import dashboard; print\\('import OK'\\)\")",
       "Bash(git init *)",
-      "Bash(git add *)"
+      "Bash(git add *)",
+      "Bash(git rm *)",
+      "Bash(git -c user.email=bot@localhost -c user.name=Kevin commit -m 'Checkpoint 2026-05-10: stable state before strategy modifications *)",
+      "Bash(git tag *)",
+      "Bash(git checkout *)",
+      "Bash(git -c user.email=bot@localhost -c user.name=Kevin commit -m 'Log multi-model deterministic forecasts alongside ECMWF *)",
+      "Bash(git -c user.email=bot@localhost -c user.name=Kevin commit -m 'Add depth-of-book check before order placement *)",
+      "Bash(git -c user.email=bot@localhost -c user.name=Kevin commit -m 'Fix slot-based dedup to match 20-min cron cadence *)",
+      "Bash(git -c user.email=bot@localhost -c user.name=Kevin commit -m 'Add same-day logging — required for METAR feedback strategy *)",
+      "Bash(git -c user.email=bot@localhost -c user.name=Kevin commit -m 'Fix _rounded_observation float-precision artifact for F-side stations *)",
+      "Bash(ssh root@209.250.227.207 'pgrep -f \"resolve_log.py\" > /dev/null')",
+      "Bash(ssh root@209.250.227.207 'cd /root/Weather_Bot && tail -5 /tmp/resolve_log.out 2>/dev/null')",
+      "Bash(git -c user.email=bot@localhost -c user.name=Kevin commit -m 'Dedupe pending records in resolve_log to fix slow cron *)",
+      "Bash(git -c user.email=bot@localhost -c user.name=Kevin commit -m 'Fix AIFS model ID from ecmwf_aifs025 to ecmwf_aifs025_single *)",
+      "Bash(git -c user.email=bot@localhost -c user.name=Kevin commit -m 'Pin three remaining backtest scripts and ignore local Claude state *)",
+      "Bash(ssh root@185.92.223.213 'cd /root/Weather_Bot && PYTHONPATH=. .venv/bin/python daily_summary.py 2>&1')"
     ]
   }
 }

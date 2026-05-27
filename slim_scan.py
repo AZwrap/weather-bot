@@ -339,7 +339,7 @@ async def run_metar_early_tail(
         extreme_so_far_c=extreme_c, n_observations_used=n_observations,
         winning_bucket_kind=win_kind, winning_bucket_threshold=win_thr,
         winning_bucket_label=getattr(winning_market, "bucket_label", None),
-        event_slug=ev.slug, event_id=ev.id,
+        event_slug=ev.slug, event_id=ev.event_id,
         yes_token_id=getattr(winning_market, "yes_token_id", None),
         market_yes_ask=getattr(winning_market, "yes_ask", None),
         market_yes_bid=getattr(winning_market, "yes_bid", None),

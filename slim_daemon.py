@@ -240,7 +240,7 @@ async def _run_lockin_yes(state: DaemonState, station, ev, upd: WUGUpdate) -> No
         n_observations_used=upd.n_observations,
         winning_bucket_kind=win_kind, winning_bucket_threshold=win_thr,
         winning_bucket_label=getattr(winning_market, "bucket_label", None),
-        event_slug=ev.slug, event_id=ev.id,
+        event_slug=ev.slug, event_id=ev.event_id,
         yes_token_id=getattr(winning_market, "yes_token_id", None),
         market_yes_ask=getattr(winning_market, "yes_ask", None),
         market_yes_bid=getattr(winning_market, "yes_bid", None),

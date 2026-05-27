@@ -287,7 +287,7 @@ async def snapshot_one(
         wug_last_obs_utc=wug.last_observation_utc,
         wug_status=wug.raw_status,
         event_slug=ev.slug,
-        event_id=ev.id,
+        event_id=ev.event_id,
         buckets=buckets,
         matched_bucket_kind=matched_kind,
         matched_bucket_threshold=matched_thr,
