@@ -1,0 +1,43 @@
+[Unit]
+Description=Weather Bot — slim_daemon.py
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Replace /USER and /PROJECT_PATH/Weather_Bot at install time, e.g. via
+#   sudo sed -i "s|/USER|$USER|g; s|/PROJECT_PATH/Weather_Bot|$PWD|g" \
+#       /etc/systemd/system/slim-daemon.service
+User=/USER
+WorkingDirectory=/PROJECT_PATH/Weather_Bot
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/PROJECT_PATH/Weather_Bot/.venv/bin/python /PROJECT_PATH/Weather_Bot/slim_daemon.py
+
+# Restart on crash but not on intentional exits (KILL_SWITCH → exit 0).
+Restart=on-failure
+RestartSec=10
+
+# Watchdog: daemon must continue producing output / completing its
+# main-loop iteration. systemd kills + restarts the service if no
+# kick within 120s. The current slim_daemon doesn't yet call
+# sd_notify(WATCHDOG=1) — when wired, set Type=notify.
+Type=simple
+# Type=notify
+# WatchdogSec=120
+
+# Stop signal: SIGINT triggers the shutdown_event handler in slim_daemon
+# (via loop.add_signal_handler). Give it 30s to drain pollers + WS task.
+KillSignal=SIGINT
+TimeoutStopSec=30
+
+# Resource limits — daemon is light. Single Python process,
+# ~50-150 MB resident with the BookCache populated.
+MemoryHigh=512M
+MemoryMax=1G
+LimitNOFILE=4096
+
+# Logs go to journald by default; query with:
+#   sudo journalctl -u slim-daemon -f
+#   sudo journalctl -u slim-daemon --since "1 hour ago"
+
+[Install]
+WantedBy=multi-user.target
