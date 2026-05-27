@@ -83,8 +83,7 @@ async def main_async(args: argparse.Namespace) -> int:
                 if m.yes_token_id:
                     all_tokens.append(m.yes_token_id)
         clob = await fetch_clob_prices_batch(all_tokens, http)
-        for ev in events:
-            apply_clob_prices(ev, clob)
+        apply_clob_prices(events, clob)
 
         print(
             f"[pubwin] {now_utc.isoformat()} fetched {len(events)} events; "

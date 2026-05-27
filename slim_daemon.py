@@ -269,8 +269,7 @@ async def refresh_events_and_pollers(state: DaemonState) -> None:
             if m.no_token_id:
                 all_tokens.append(m.no_token_id)
     clob = await fetch_clob_prices_batch(all_tokens, state.http)
-    for ev in events:
-        apply_clob_prices(ev, clob)
+    apply_clob_prices(events, clob)
     state.events = events
 
     # Rebuild event-by-sk lookup + active station set.

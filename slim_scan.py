@@ -182,8 +182,7 @@ async def run_scan(args: argparse.Namespace) -> int:
                 if m.yes_token_id:
                     all_tokens.append(m.yes_token_id)
         clob_prices = await fetch_clob_prices_batch(all_tokens, http)
-        for ev in events:
-            apply_clob_prices(ev, clob_prices)
+        apply_clob_prices(events, clob_prices)
 
         print(f"[scan] fetched {len(events)} events, {len(all_tokens)} tokens")
 
