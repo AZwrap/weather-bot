@@ -253,40 +253,63 @@ async def run_metar_early_tail(
     http: httpx.AsyncClient,
     intraday_log: list[IntradayDecision],
 ) -> None:
+    """Lock-in YES detection. WUG primary, METAR fallback.
+
+    WUG = Polymarket's oracle source. We always try it first; only if
+    WUG returns no_data do we fall back to METAR + critical-gap check.
+    """
+    from weather_bot.wunderground import fetch_wunderground_daily
+
     sid = station.station_id
     target_date_iso = target_date.isoformat()
 
     if already_decided(sid, target, target_date_iso, intraday_log):
         return
 
-    df = await fetch_metar_hourly_today(
-        station.location, station.icao, target_date, client=http,
-    )
     now_iso = datetime.now(timezone.utc).isoformat()
+    extreme_c: float | None = None
+    source: str = ""
+    n_observations: int = 0
 
-    if df is None or df.empty:
-        decision = IntradayDecision(
-            scan_time_utc=now_iso, station_id=sid, target=target,
-            target_date=target_date_iso, decision="NO_OBS",
-            reason="empty METAR dataframe",
+    # ── Primary: WUG ──
+    wug = await fetch_wunderground_daily(sid, target_date, client=http)
+    wug_ext = wug.daily_max_c if target == "max" else wug.daily_min_c
+    if wug_ext is not None:
+        extreme_c = float(wug_ext)
+        source = "wug"
+        n_observations = wug.n_observations
+
+    # ── Fallback: METAR ──
+    if extreme_c is None:
+        df = await fetch_metar_hourly_today(
+            station.location, station.icao, target_date, client=http,
         )
-        append_intraday_decision(decision)
-        intraday_log.append(decision)
-        return
-
-    has_gap, gap_min, gap_at = metar_has_critical_gap(df, target)
-    if has_gap:
-        decision = IntradayDecision(
-            scan_time_utc=now_iso, station_id=sid, target=target,
-            target_date=target_date_iso, decision="CRITICAL_GAP",
-            reason=f"gap {gap_min:.0f}min @ {gap_at}",
-            n_observations_used=len(df),
+        if df is None or df.empty:
+            decision = IntradayDecision(
+                scan_time_utc=now_iso, station_id=sid, target=target,
+                target_date=target_date_iso, decision="NO_OBS",
+                reason=f"WUG {wug.raw_status} + empty METAR fallback",
+            )
+            append_intraday_decision(decision)
+            intraday_log.append(decision)
+            return
+        has_gap, gap_min, gap_at = metar_has_critical_gap(df, target)
+        if has_gap:
+            decision = IntradayDecision(
+                scan_time_utc=now_iso, station_id=sid, target=target,
+                target_date=target_date_iso, decision="CRITICAL_GAP",
+                reason=f"WUG {wug.raw_status} + METAR gap {gap_min:.0f}min @ {gap_at}",
+                n_observations_used=len(df),
+            )
+            append_intraday_decision(decision)
+            intraday_log.append(decision)
+            return
+        extreme_c = float(
+            df["temp_c"].max() if target == "max" else df["temp_c"].min()
         )
-        append_intraday_decision(decision)
-        intraday_log.append(decision)
-        return
+        source = "metar_fallback"
+        n_observations = len(df)
 
-    extreme_c = float(df["temp_c"].max() if target == "max" else df["temp_c"].min())
     bucket_kinds_thresholds = [parse_bucket(m) for m in ev.markets]
     win = find_early_tail_winner(extreme_c, target, bucket_kinds_thresholds, station.unit)
 
@@ -294,7 +317,8 @@ async def run_metar_early_tail(
         decision = IntradayDecision(
             scan_time_utc=now_iso, station_id=sid, target=target,
             target_date=target_date_iso, decision="NO_TAIL_CROSSED",
-            extreme_so_far_c=extreme_c, n_observations_used=len(df),
+            extreme_so_far_c=extreme_c, n_observations_used=n_observations,
+            reason=f"source={source}",
         )
         append_intraday_decision(decision)
         intraday_log.append(decision)
@@ -310,10 +334,10 @@ async def run_metar_early_tail(
         scan_time_utc=now_iso, station_id=sid, target=target,
         target_date=target_date_iso, decision="BUY_EARLY_TAIL",
         reason=(
-            f"observed {extreme_c:.1f}°C crossed {win_kind} threshold {win_thr} "
-            f"(locked-in winner)"
+            f"{source} observed {extreme_c:.1f}°C crossed {win_kind} threshold "
+            f"{win_thr} (locked-in winner)"
         ),
-        extreme_so_far_c=extreme_c, n_observations_used=len(df),
+        extreme_so_far_c=extreme_c, n_observations_used=n_observations,
         winning_bucket_kind=win_kind, winning_bucket_threshold=win_thr,
         winning_bucket_label=getattr(winning_market, "bucket_label", None),
         event_slug=ev.slug, event_id=ev.id,
@@ -324,7 +348,7 @@ async def run_metar_early_tail(
     append_intraday_decision(decision)
     intraday_log.append(decision)
     print(
-        f"  [metar] {sid}/{target} {target_date_iso}: "
+        f"  [lock-in:{source}] {sid}/{target} {target_date_iso}: "
         f"BUY_EARLY_TAIL {win_kind} {win_thr} (extreme {extreme_c:.1f}°C)"
     )
 

@@ -292,8 +292,20 @@ def detect_and_execute_guaranteed_buys(
     # would deploy $150+ in one shot, breaching the daily cap.
     daily_limit = float(getattr(client.config, "daily_deployment_limit_usd", 150.0))
 
-    # Find ALL dead buckets in this event (could be multiple — every
-    # bucket below the peak is dead for max-target)
+    # PROGRESSIVE EVAL (2026-05-28). Layer 7 used to scan ALL buckets and
+    # dedupe via Portfolio.is_open per fill. With a daemon polling WUG
+    # every ~60s, this re-evaluates the same dead buckets dozens of times
+    # per scan. The tracker on Portfolio (last_evaluated_max_by_sk) lets
+    # us skip buckets we've already evaluated as dead in a prior tick:
+    # only buckets whose dead-edge falls between the previously-evaluated
+    # extreme and the current observation are candidates.
+    from .pnl import _rounded_observation as _round_obs
+    last_eval = portfolio.get_last_evaluated_max(
+        station_id, target, target_date_iso,
+    )
+
+    # Find dead buckets in this event, filtered by the progressive
+    # tracker so we only consider buckets that JUST became dead.
     dead_buckets: list[tuple] = []  # (market, kind, threshold, low_c, high_c)
     for m in bucket_snapshots:
         if not m.no_token_id:
@@ -303,6 +315,16 @@ def detect_and_execute_guaranteed_buys(
             low_c, high_c = bucket_edges_c(kind, int(thr), station.unit)
         except (ValueError, TypeError, KeyError):
             continue
+
+        # Progressive filter: skip buckets we already evaluated in a
+        # prior WUG tick. For max-target a bucket was already-evaluated
+        # if its upper edge ≤ last_eval (we crossed it before). Mirror
+        # for min-target on lower edge.
+        if last_eval is not None:
+            if target == "max" and high_c <= float(last_eval) + 1e-9:
+                continue
+            if target == "min" and low_c >= float(last_eval) - 1e-9:
+                continue
 
         is_dead = False
         margin_c = 0.0  # how far past the bucket edge the observation is
@@ -956,5 +978,19 @@ def detect_and_execute_guaranteed_buys(
 
     # NOTE: per-iteration portfolio.save() runs after each add (orphan-order
     # guard, see ORPHAN-ORDER GUARD comments above). No post-loop save needed.
+
+    # PROGRESSIVE EVAL — advance the per-(station, target, date) tracker
+    # so the next WUG-driven call skips buckets we just evaluated. This
+    # runs whether we filled or not: even a no-action call confirms there
+    # are no newly-dead buckets up to the current observed extreme.
+    try:
+        observed_int = _round_obs(observed_extreme_c, station.unit)
+        portfolio.set_last_evaluated_max(
+            station_id, target, target_date_iso, int(observed_int),
+        )
+        portfolio.save(portfolio_path)
+    except Exception:
+        # Never fail the function over tracker bookkeeping.
+        pass
 
     return dict(counts)

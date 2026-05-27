@@ -343,6 +343,18 @@ class Portfolio:
     # rebate income alongside resolution PnL.
     daily_maker_rebates: dict[str, float] = field(default_factory=dict)
 
+    # Progressive-eval tracker for Layer 7 + high-bucket NO (2026-05-28).
+    # Key: f"{station_id}|{target}|{target_date_iso}". Value: integer
+    # max-so-far observation in the station's market unit (°C or °F),
+    # i.e. the last `_rounded_observation` we've already evaluated dead
+    # buckets up to. Used to avoid re-checking buckets that became dead
+    # in earlier WUG ticks.
+    #
+    # On WUG update W > last_evaluated[key]: iterate dead steps from
+    # last_evaluated + 1 to W inclusive, evaluate each containing bucket
+    # exactly once, then advance the tracker.
+    last_evaluated_max_by_sk: dict[str, int] = field(default_factory=dict)
+
     # ── Persistence ────────────────────────────────────────────────────
 
     @classmethod
@@ -380,10 +392,21 @@ class Portfolio:
                     rebates[str(k)] = float(v)
                 except (TypeError, ValueError):
                     continue
+        # last_evaluated_max_by_sk: dict of "sid|target|date" → int.
+        # Older files won't have it. Skip malformed values silently.
+        le_raw = data.get("last_evaluated_max_by_sk", {}) or {}
+        last_eval: dict[str, int] = {}
+        if isinstance(le_raw, dict):
+            for k, v in le_raw.items():
+                try:
+                    last_eval[str(k)] = int(v)
+                except (TypeError, ValueError):
+                    continue
         return cls(
             positions=positions,
             version=int(data.get("version", 1)),
             daily_maker_rebates=rebates,
+            last_evaluated_max_by_sk=last_eval,
         )
 
     def _audit_save(self, event: dict) -> None:
@@ -468,6 +491,7 @@ class Portfolio:
                 "version": self.version,
                 "positions": [p.to_jsonable() for p in self.positions],
                 "daily_maker_rebates": dict(self.daily_maker_rebates),
+                "last_evaluated_max_by_sk": dict(self.last_evaluated_max_by_sk),
             }
             atomic_write_json(path, payload)
             self._audit_save({
@@ -579,10 +603,29 @@ class Portfolio:
                 for k, v in on_disk_rebates.items():
                     merged_rebates[k] = max(merged_rebates.get(k, 0.0), v)
 
+                # last_evaluated_max_by_sk: monotonically rising per
+                # (station,target,date) since the daily extreme only
+                # moves outward → take max across both sides.
+                on_disk_le: dict[str, int] = {}
+                try:
+                    on_disk_le_raw = on_disk.get("last_evaluated_max_by_sk", {}) or {}
+                    if isinstance(on_disk_le_raw, dict):
+                        for k, v in on_disk_le_raw.items():
+                            try:
+                                on_disk_le[str(k)] = int(v)
+                            except (TypeError, ValueError):
+                                continue
+                except Exception:
+                    on_disk_le = {}
+                merged_le = dict(self.last_evaluated_max_by_sk)
+                for k, v in on_disk_le.items():
+                    merged_le[k] = max(merged_le.get(k, v), v)
+
                 payload = {
                     "version": self.version,
                     "positions": [p.to_jsonable() for p in merged_positions],
                     "daily_maker_rebates": merged_rebates,
+                    "last_evaluated_max_by_sk": merged_le,
                 }
                 atomic_write_json(path, payload)
 
@@ -617,6 +660,7 @@ class Portfolio:
                 # AGAIN as "disk-only").
                 self.positions = merged_positions
                 self.daily_maker_rebates = merged_rebates
+                self.last_evaluated_max_by_sk = merged_le
             finally:
                 fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
 
@@ -630,6 +674,45 @@ class Portfolio:
             ):
                 return True
         return False
+
+    # ── Progressive-eval tracker (Layer 7 + high-bucket NO) ────────────
+
+    @staticmethod
+    def _sk_key(station_id: str, target: str, target_date_iso: str) -> str:
+        return f"{station_id}|{target}|{target_date_iso}"
+
+    def get_last_evaluated_max(
+        self, station_id: str, target: str, target_date_iso: str,
+    ) -> int | None:
+        """Return the last integer extreme we evaluated dead buckets up
+        to for this (station, target, date), or None if unseen.
+
+        For `target="max"`: the integer °C/°F that the running max has
+        reached. New WUG readings strictly higher than this trigger
+        progressive evaluation of newly-dead buckets.
+        For `target="min"`: the integer °C/°F the running min has
+        reached (which moves DOWNWARD over the day). New WUG readings
+        strictly lower than this trigger evaluation.
+        """
+        return self.last_evaluated_max_by_sk.get(
+            self._sk_key(station_id, target, target_date_iso)
+        )
+
+    def set_last_evaluated_max(
+        self, station_id: str, target: str, target_date_iso: str, value: int,
+    ) -> None:
+        """Advance the tracker. Monotone: for max-target only writes if
+        value > existing; for min-target only writes if value < existing.
+        """
+        key = self._sk_key(station_id, target, target_date_iso)
+        cur = self.last_evaluated_max_by_sk.get(key)
+        if cur is None:
+            self.last_evaluated_max_by_sk[key] = int(value)
+            return
+        if target == "max" and int(value) > cur:
+            self.last_evaluated_max_by_sk[key] = int(value)
+        elif target == "min" and int(value) < cur:
+            self.last_evaluated_max_by_sk[key] = int(value)
 
     def _last_cancel_for(self, token_id: str, side: Side) -> Position | None:
         """Most-recent cancelled record for (token, side), or None."""
