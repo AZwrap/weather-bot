@@ -36,6 +36,8 @@ LOGS = {
     "persistence_tail": DATA / "persistence_tail_log.jsonl",
     "consistency_arb": DATA / "consistency_arb_log.jsonl",
     "consensus_yes": DATA / "consensus_yes_log.jsonl",
+    "consensus_yes_exit": DATA / "consensus_yes_exit_log.jsonl",
+    "forward_log": DATA / "forward_log.jsonl",
     "publication_window": DATA / "publication_window_log.jsonl",
     "portfolio_audit": DATA / "portfolio_save_audit.jsonl",
 }
@@ -173,6 +175,8 @@ hbn = load_jsonl(str(LOGS["hbn"]))
 pers_tail = load_jsonl(str(LOGS["persistence_tail"]))
 cons_arb = load_jsonl(str(LOGS["consistency_arb"]))
 cons_yes = load_jsonl(str(LOGS["consensus_yes"]))
+cons_yes_exit = load_jsonl(str(LOGS["consensus_yes_exit"]))
+forward_log = load_jsonl(str(LOGS["forward_log"]))
 pub_window = load_jsonl(str(LOGS["publication_window"]))
 audit = load_jsonl(str(LOGS["portfolio_audit"]))
 
@@ -500,6 +504,31 @@ with tabs[7]:
     else:
         st.info("No consensus-YES fires yet. Strategy fires when the leading "
                 "mid bucket's yes_ask is in [$0.40, $0.85].")
+
+    # Trailing-stop exits
+    st.subheader("Trailing-stop exits (consensus YES)")
+    st.caption("Sell when current_yes_ask < peak AND ≥ entry + $0.05. "
+               "Holds while price climbs; only locks gains on a turn-down.")
+    if cons_yes_exit:
+        sold = [r for r in cons_yes_exit if r.get("result") == "sold"]
+        st.write(f"**{len(sold)}** sold, {len(cons_yes_exit)-len(sold)} non-sell log entries.")
+        if sold:
+            df = pd.DataFrame(sold).sort_values("ts_utc", ascending=False).head(50)
+            cols = [c for c in ["ts_utc", "station_id", "bucket_label",
+                                "entry_price", "peak_yes_ask",
+                                "current_yes_ask", "submitted_sell_limit",
+                                "fill_price", "shares",
+                                "net_per_share_usd", "net_total_usd"]
+                    if c in df.columns]
+            st.dataframe(df[cols], use_container_width=True, hide_index=True)
+
+            total_net = sum(r.get("net_total_usd", 0) for r in sold)
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Exits", len(sold))
+            col2.metric("Total net (paper)", f"${total_net:+.2f}")
+            col3.metric("Avg per exit", f"${total_net/len(sold):+.2f}")
+    else:
+        st.info("No trailing-stop exits yet.")
 
 
 # Tab 8 — Publication window

@@ -52,6 +52,7 @@ from .scanner import TradeSignal
 
 
 DEFAULT_LOG_PATH = Path("data/consensus_yes_log.jsonl")
+DEFAULT_EXIT_LOG_PATH = Path("data/consensus_yes_exit_log.jsonl")
 
 MIN_YES_ASK: float = 0.40
 """Below this, consensus hasn't formed — too many buckets still in
@@ -63,6 +64,17 @@ the run-up; YES at $0.90+ is the same trade Layer 7 would have done
 much cheaper had it fired. Skip."""
 
 DEFAULT_SIZE_USD: float = 5.0
+
+# Exit (trailing-stop) parameters
+MIN_PROFIT_FROM_ENTRY: float = 0.05
+"""Sell only once current_ask is at least 5pp above entry price.
+Below this we hold even on declines (would be a loss after fees)."""
+
+PEAK_DECLINE_TICKS: float = 0.01
+"""Minimum decline below the peak (in $) before we treat a drop as
+'turning down'. Default $0.01 = one tick of Polymarket's price grid.
+Lower = more sensitive (faster exits, less profit per fire).
+Higher = need a larger drawdown before triggering."""
 
 
 def _now_utc_iso() -> str:
@@ -235,3 +247,169 @@ def detect_and_execute_consensus_yes(
               f"(limit ${submitted_limit:.2f})")
 
     return dict(counts)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Trailing-stop exit logic
+# ──────────────────────────────────────────────────────────────────────
+
+def _peak_key(token_id: str, side: str) -> str:
+    return f"{token_id}|{side}"
+
+
+def _log_exit(record: dict, log_path: Path = DEFAULT_EXIT_LOG_PATH) -> None:
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, default=str) + "\n")
+    except (OSError, TypeError, ValueError):
+        pass
+
+
+def evaluate_consensus_yes_exits(
+    *,
+    events: list,
+    client: Any,
+    portfolio: Portfolio,
+    portfolio_path: Path = DEFAULT_PORTFOLIO_PATH,
+    min_profit_from_entry: float = MIN_PROFIT_FROM_ENTRY,
+    peak_decline_ticks: float = PEAK_DECLINE_TICKS,
+    log_path: Path = DEFAULT_EXIT_LOG_PATH,
+    verbose: bool = False,
+) -> dict[str, int]:
+    """Walk all open consensus_yes positions, update peak tracker,
+    fire SELL when the trailing-stop trigger fires.
+
+    Trigger:
+      current_yes_ask < (peak − peak_decline_ticks)
+      AND current_yes_ask >= entry_price + min_profit_from_entry
+
+    Sells at current_yes_bid (= taker hits the bid). All paper-only
+    under dry-run client.
+    """
+    counts: dict[str, int] = defaultdict(int)
+    counts["sold"] = 0
+
+    # Build token_id → current (yes_ask, yes_bid) lookup
+    quotes: dict[str, tuple[float | None, float | None]] = {}
+    for ev in events:
+        for m in ev.markets:
+            if m.yes_token_id:
+                quotes[m.yes_token_id] = (m.yes_ask, m.yes_bid)
+
+    for p in list(portfolio.positions):
+        if p.strategy != "consensus_yes":
+            continue
+        if p.status != "filled":
+            continue
+        if p.side != "YES":
+            continue
+        ya, yb = quotes.get(p.token_id, (None, None))
+        if ya is None:
+            counts["skipped_no_quote"] += 1
+            continue
+
+        key = _peak_key(p.token_id, p.side)
+        peak = portfolio.consensus_yes_peak_by_pos.get(key, p.entry_price)
+
+        # Update peak when current_ask climbs
+        if ya > peak:
+            portfolio.consensus_yes_peak_by_pos[key] = float(ya)
+            counts["peak_updated"] += 1
+            continue
+
+        # Trailing-stop trigger
+        decline_below_peak = peak - ya
+        profit_above_entry = ya - p.entry_price
+        if (decline_below_peak >= peak_decline_ticks
+                and profit_above_entry >= min_profit_from_entry):
+            # Submit a SELL YES. Use yes_bid as the achievable price
+            # (taker hits bid); fall back to ya - 0.01 if bid missing.
+            sell_target = yb if yb is not None else max(0.01, ya - 0.01)
+            # Submit at limit = sell_target rounded down to 2 decimals
+            import math
+            limit_sell = max(0.01, math.floor(sell_target * 100) / 100.0)
+
+            signal = TradeSignal(
+                station=STATIONS_BY_ID.get(p.station_id) or _stub_station(p),
+                event_title="", event_slug="",
+                target="max" if "max" in str(p.target_date) else p.bucket_kind,
+                target_date=datetime.fromisoformat(p.target_date).date(),
+                bucket_label=p.bucket_label, bucket_kind=p.bucket_kind,
+                market_id=int(p.market_id), token_id=p.token_id,
+                our_prob=ya, yes_implied=ya,
+                yes_bid=yb, yes_ask=ya,
+                side="YES", edge=0.0,
+                fill_price=limit_sell, volume_24hr=0.0,
+                bias_applied_c=0.0, sigma_ensemble_c=0.0, sigma_total_c=0.0,
+                kelly_full=1.0, position_usd=p.position_usd,
+            )
+            try:
+                result = client.submit_order(
+                    signal, order_type="FAK", sdk_side="SELL",
+                    limit_price=limit_sell, override_shares=p.shares,
+                )
+            except Exception as exc:
+                counts["submit_failed"] += 1
+                _log_exit({
+                    "ts_utc": _now_utc_iso(), "result": "submit_exception",
+                    "station_id": p.station_id, "token_id": p.token_id,
+                    "bucket_label": p.bucket_label, "exc": str(exc)[:200],
+                }, log_path)
+                continue
+            if not result.ok:
+                counts["submit_failed"] += 1
+                _log_exit({
+                    "ts_utc": _now_utc_iso(), "result": "rejected",
+                    "station_id": p.station_id, "token_id": p.token_id,
+                    "bucket_label": p.bucket_label,
+                    "message": (result.message or "")[:200],
+                }, log_path)
+                continue
+
+            # Mark position closed in-memory (no extra dataclass field;
+            # we update status). Real portfolio mark_resolved isn't
+            # appropriate (this is a sell, not a resolution).
+            p.status = "filled_closed"
+            try:
+                portfolio.save(portfolio_path)
+            except Exception:
+                pass
+            counts["sold"] += 1
+            net_per_share = limit_sell - p.entry_price
+            _log_exit({
+                "ts_utc": _now_utc_iso(), "result": "sold",
+                "station_id": p.station_id,
+                "target_date": p.target_date,
+                "bucket_label": p.bucket_label,
+                "bucket_threshold": p.bucket_threshold,
+                "entry_price": p.entry_price,
+                "peak_yes_ask": peak,
+                "current_yes_ask": ya,
+                "current_yes_bid": yb,
+                "submitted_sell_limit": limit_sell,
+                "fill_price": result.fill_price,
+                "shares": p.shares,
+                "net_per_share_usd": net_per_share,
+                "net_total_usd": net_per_share * p.shares,
+                "order_id": result.order_id,
+            }, log_path)
+            if verbose:
+                print(f"  [cons-yes-exit] {p.station_id} {p.bucket_label} "
+                      f"entry ${p.entry_price:.3f} → peak ${peak:.3f} → "
+                      f"sell ${limit_sell:.3f} (net ${net_per_share*p.shares:+.2f})")
+        else:
+            counts["holding"] += 1
+
+    return dict(counts)
+
+
+def _stub_station(p: Position):
+    """Build a placeholder Station for TradeSignal when STATIONS_BY_ID
+    lookup fails (shouldn't happen but defensive)."""
+    class _S:
+        name = ""
+        station_id = p.station_id
+        timezone = "UTC"
+        unit = "C"
+    return _S()

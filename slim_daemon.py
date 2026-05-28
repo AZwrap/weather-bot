@@ -35,8 +35,12 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
 
 import httpx
 
-from weather_bot.consensus_yes import detect_and_execute_consensus_yes
+from weather_bot.consensus_yes import (
+    detect_and_execute_consensus_yes,
+    evaluate_consensus_yes_exits,
+)
 from weather_bot.consistency_arb import detect_and_execute_consistency_arb
+from weather_bot.daily_resolver import resolve_settled_events
 from weather_bot.exclusions import load_active_exclusions
 from weather_bot.fees import fetch_live_fee_config, warn_if_fee_config_changed
 from weather_bot.guaranteed_no_buy import detect_and_execute_guaranteed_buys
@@ -426,7 +430,7 @@ async def refresh_events_and_pollers(state: DaemonState) -> None:
               file=sys.stderr)
 
     # Consistency arb — scans paired (max, min) events for
-    # P(min ≥ T) > P(max ≥ T) violations. Sync, run inline (cheap).
+    # implementable arb (buy YES on both sides). Sync, run inline (cheap).
     try:
         counts = detect_and_execute_consistency_arb(
             events=list(new_events_by_sk.values()),
@@ -439,6 +443,38 @@ async def refresh_events_and_pollers(state: DaemonState) -> None:
                   f"pairs_scanned={counts.get('pairs_scanned', 0)}")
     except Exception as exc:
         print(f"[cons-arb] failed: {type(exc).__name__}: {exc}",
+              file=sys.stderr)
+
+    # Consensus-YES trailing exit — walks open consensus_yes positions
+    # and sells the ones whose price came back down ≥ peak_decline_ticks
+    # below their peak while still ≥ entry + 5pp profit. Paper-only.
+    try:
+        exit_counts = evaluate_consensus_yes_exits(
+            events=list(new_events_by_sk.values()),
+            client=state.client,
+            portfolio=state.portfolio,
+            portfolio_path=state.args.portfolio_path,
+        )
+        if exit_counts and exit_counts.get("sold", 0) > 0:
+            print(f"[cons-yes-exit] sold={exit_counts['sold']}  "
+                  f"holding={exit_counts.get('holding', 0)}")
+    except Exception as exc:
+        print(f"[cons-yes-exit] failed: {type(exc).__name__}: {exc}",
+              file=sys.stderr)
+
+    # Daily resolver — fetch WUG actuals for events past midend-local
+    # + 2h grace, append to data/forward_log.jsonl. Feeds
+    # persistence_tail's priors + the publication-window analyzer.
+    try:
+        res_counts = await resolve_settled_events(
+            events_by_sk=new_events_by_sk,
+            stations_by_sk=new_stations_by_sk,
+            http=state.http,
+        )
+        if res_counts.get("resolved", 0) > 0 or res_counts.get("skipped_no_data", 0) > 0:
+            print(f"[resolver] {res_counts}")
+    except Exception as exc:
+        print(f"[resolver] failed: {type(exc).__name__}: {exc}",
               file=sys.stderr)
 
     print(

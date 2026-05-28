@@ -72,12 +72,38 @@ def _log_event(record: dict, log_path: Path = DEFAULT_LOG_PATH) -> None:
         pass
 
 
+def _bucket_fully_ge_T(kind: str, t: int, T: int) -> bool:
+    """True iff every value in this bucket is ≥ T (= safe to include
+    in 'extreme ≥ T' sum without overcounting)."""
+    if kind == "mid":
+        return t >= T
+    if kind == "high_tail":
+        return t >= T   # high_tail covers [t, +inf); fully ≥ T iff t ≥ T
+    return False        # low_tail covers (-inf, t+w); never fully ≥ T
+
+
+def _bucket_fully_lt_T(kind: str, t: int, T: int, bucket_width: int) -> bool:
+    """True iff every value in this bucket is < T (= safe to include
+    in 'extreme < T' sum without overcounting).
+
+    bucket_width is the integer step (1 for °C, 2 for °F).
+    A mid bucket with threshold t covers [t, t+bucket_width). Fully
+    below T iff t + bucket_width ≤ T, i.e. t ≤ T - bucket_width.
+    """
+    if kind == "mid":
+        return t + bucket_width <= T
+    if kind == "low_tail":
+        # low_tail "X or below" covers (-inf, t+bucket_width).
+        # Fully < T iff t + bucket_width ≤ T.
+        return t + bucket_width <= T
+    return False    # high_tail covers [t, +inf); never fully < T
+
+
 def _cumulative_yes_ask_ge_threshold(
     markets: list[Any], threshold: int,
 ) -> tuple[float | None, int, list[Any]]:
-    """Compute P(extreme ≥ threshold) implied by market YES asks AND
-    return the buckets used. Returns (p_estimate, n_used, bucket_list).
-    p_estimate=None if no usable buckets."""
+    """Sum of YES asks across buckets fully ≥ threshold. Returns
+    (sum, n_used, bucket_list). None if no usable buckets."""
     from weather_bot.polymarket import parse_bucket
     total = 0.0
     n = 0
@@ -89,15 +115,35 @@ def _cumulative_yes_ask_ge_threshold(
             kind, t = parse_bucket(m)
         except Exception:
             continue
-        if kind == "mid" and t >= threshold:
+        if _bucket_fully_ge_T(kind, t, threshold):
             total += float(m.yes_ask)
             n += 1
             used.append(m)
-        elif kind == "high_tail" and t >= threshold:
+    if n == 0:
+        return None, 0, []
+    return total, n, used
+
+
+def _cumulative_yes_ask_lt_threshold(
+    markets: list[Any], threshold: int, bucket_width: int,
+) -> tuple[float | None, int, list[Any]]:
+    """Sum of YES asks across buckets fully < threshold. To buy NO on
+    'extreme ≥ T', we equivalently buy YES on every bucket fully < T."""
+    from weather_bot.polymarket import parse_bucket
+    total = 0.0
+    n = 0
+    used: list[Any] = []
+    for m in markets:
+        if m.yes_ask is None or m.yes_ask <= 0:
+            continue
+        try:
+            kind, t = parse_bucket(m)
+        except Exception:
+            continue
+        if _bucket_fully_lt_T(kind, t, threshold, bucket_width):
             total += float(m.yes_ask)
             n += 1
             used.append(m)
-        # low_tail or below-threshold buckets are omitted
     if n == 0:
         return None, 0, []
     return total, n, used
@@ -116,6 +162,7 @@ def detect_and_execute_consistency_arb(
 ) -> dict[str, int]:
     """Scan event list for max/min consistency arbs, fire paper trades
     on opportunities ≥ min_margin_usd."""
+    from weather_bot.locations import STATIONS_BY_ID
     from weather_bot.polymarket import (
         event_target_date, match_event_to_station, parse_bucket,
     )
@@ -139,6 +186,8 @@ def detect_and_execute_consistency_arb(
         pairs.setdefault(key, {})[target] = ev
 
     for (sid, td_iso), sides in pairs.items():
+        station = STATIONS_BY_ID.get(sid)
+        bucket_width = 1 if (station and station.unit == "C") else 2
         ev_max = sides.get("max")
         ev_min = sides.get("min")
         if not (ev_max and ev_min):
@@ -163,29 +212,33 @@ def detect_and_execute_consistency_arb(
             continue
 
         for T in thresholds:
-            p_max_ge_T, n_max, max_buckets = _cumulative_yes_ask_ge_threshold(
+            # MAX leg: buy YES on every max-event bucket ≥ T. Pays $1 if
+            # max ≥ T. Cost = sum of yes_ask across those buckets.
+            cost_max_leg, n_max, max_buckets = _cumulative_yes_ask_ge_threshold(
                 ev_max.markets, T,
             )
-            p_min_ge_T, n_min, min_buckets = _cumulative_yes_ask_ge_threshold(
-                ev_min.markets, T,
+            # MIN leg: buy NO on the cumulative "min ≥ T" event, which
+            # equals buying YES on every min-event bucket fully < T.
+            # Pays $1 if min < T. Cost = sum of yes_ask across those.
+            cost_min_leg, n_min, min_buckets = _cumulative_yes_ask_lt_threshold(
+                ev_min.markets, T, bucket_width,
             )
-            if p_max_ge_T is None or p_min_ge_T is None:
+            if cost_max_leg is None or cost_min_leg is None:
                 continue
-            cost = p_max_ge_T + (1.0 - p_min_ge_T)
+            cost = cost_max_leg + cost_min_leg
+            # Combined payout: $1 (min always ≤ max, so exactly one of
+            # "max ≥ T" or "min < T" wins when they don't both win;
+            # when both win, payout is $2 — but for the worst-case
+            # guaranteed margin we use min-payout = $1).
             arb_margin = 1.0 - cost
             if arb_margin < min_margin_usd:
                 counts["below_margin"] += 1
                 continue
 
-            # Opportunity found. Fire paper trades on the legs.
-            # Note: we PAPER-fire one consolidated entry per opportunity
-            # rather than per-leg, since multi-leg coordination is fragile.
-            # The synthetic OrderResult from dry-run client lands as a
-            # "filled" log line; live mode would need atomic multi-leg.
             counts["opportunities"] += 1
             if verbose:
                 print(f"  [cons-arb] {sid} {td_iso} T={T}: "
-                      f"p_max≥T={p_max_ge_T:.3f}, p_min≥T={p_min_ge_T:.3f}, "
+                      f"cost_max={cost_max_leg:.3f}, cost_min_lt={cost_min_leg:.3f}, "
                       f"margin=${arb_margin:.3f}")
 
             _log_event({
@@ -194,13 +247,18 @@ def detect_and_execute_consistency_arb(
                 "station_id": sid,
                 "target_date": td_iso,
                 "threshold": int(T),
-                "p_max_ge_T": float(p_max_ge_T),
-                "p_min_ge_T": float(p_min_ge_T),
-                "n_max_buckets": int(n_max),
-                "n_min_buckets": int(n_min),
+                "bucket_width": int(bucket_width),
+                # CORRECTED COST MATH (2026-05-28):
+                # cost_max_leg = sum(yes_ask) for max-buckets fully ≥ T
+                # cost_min_leg = sum(yes_ask) for min-buckets fully < T
+                # Both are real implementable prices (we BUY YES at ASK
+                # on both legs). cost = sum; arb_margin = 1 - cost.
+                "cost_max_leg_usd": float(cost_max_leg),
+                "cost_min_lt_leg_usd": float(cost_min_leg),
                 "cost_usd": float(cost),
                 "arb_margin_usd": float(arb_margin),
-                # Per-leg detail for the analyzer:
+                "n_max_buckets": int(n_max),
+                "n_min_buckets": int(n_min),
                 "max_legs": [
                     {"market_id": int(getattr(m, "market_id", 0)),
                      "bucket_label": getattr(m, "bucket_label", ""),
@@ -211,7 +269,7 @@ def detect_and_execute_consistency_arb(
                 "min_legs": [
                     {"market_id": int(getattr(m, "market_id", 0)),
                      "bucket_label": getattr(m, "bucket_label", ""),
-                     "no_token_id": getattr(m, "no_token_id", None),
+                     "yes_token_id": getattr(m, "yes_token_id", None),
                      "yes_ask": float(m.yes_ask)}
                     for m in min_buckets
                 ],

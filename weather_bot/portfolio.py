@@ -355,6 +355,14 @@ class Portfolio:
     # exactly once, then advance the tracker.
     last_evaluated_max_by_sk: dict[str, int] = field(default_factory=dict)
 
+    # Trailing-stop peak tracker for consensus_yes exits. Keyed by
+    # f"{token_id}|{side}" (matches Position dedupe key). Records the
+    # highest yes_ask we've observed on this position since entry.
+    # consensus_yes exit triggers when current_yes_ask < peak AND
+    # current_yes_ask >= entry_price + 0.05. See
+    # weather_bot/consensus_yes.evaluate_consensus_yes_exits().
+    consensus_yes_peak_by_pos: dict[str, float] = field(default_factory=dict)
+
     # ── Persistence ────────────────────────────────────────────────────
 
     @classmethod
@@ -402,11 +410,22 @@ class Portfolio:
                     last_eval[str(k)] = int(v)
                 except (TypeError, ValueError):
                     continue
+        # consensus_yes_peak_by_pos: dict of "token|side" → float.
+        # Older portfolio.json files won't have it.
+        peak_raw = data.get("consensus_yes_peak_by_pos", {}) or {}
+        peaks: dict[str, float] = {}
+        if isinstance(peak_raw, dict):
+            for k, v in peak_raw.items():
+                try:
+                    peaks[str(k)] = float(v)
+                except (TypeError, ValueError):
+                    continue
         return cls(
             positions=positions,
             version=int(data.get("version", 1)),
             daily_maker_rebates=rebates,
             last_evaluated_max_by_sk=last_eval,
+            consensus_yes_peak_by_pos=peaks,
         )
 
     def _audit_save(self, event: dict) -> None:
@@ -492,6 +511,7 @@ class Portfolio:
                 "positions": [p.to_jsonable() for p in self.positions],
                 "daily_maker_rebates": dict(self.daily_maker_rebates),
                 "last_evaluated_max_by_sk": dict(self.last_evaluated_max_by_sk),
+                "consensus_yes_peak_by_pos": dict(self.consensus_yes_peak_by_pos),
             }
             atomic_write_json(path, payload)
             self._audit_save({
@@ -621,11 +641,30 @@ class Portfolio:
                 for k, v in on_disk_le.items():
                     merged_le[k] = max(merged_le.get(k, v), v)
 
+                # consensus_yes_peak_by_pos: each key is per (token,
+                # side). Take max across both sides since peak is
+                # monotonically rising.
+                on_disk_peaks: dict[str, float] = {}
+                try:
+                    on_disk_peaks_raw = on_disk.get("consensus_yes_peak_by_pos", {}) or {}
+                    if isinstance(on_disk_peaks_raw, dict):
+                        for k, v in on_disk_peaks_raw.items():
+                            try:
+                                on_disk_peaks[str(k)] = float(v)
+                            except (TypeError, ValueError):
+                                continue
+                except Exception:
+                    on_disk_peaks = {}
+                merged_peaks = dict(self.consensus_yes_peak_by_pos)
+                for k, v in on_disk_peaks.items():
+                    merged_peaks[k] = max(merged_peaks.get(k, v), v)
+
                 payload = {
                     "version": self.version,
                     "positions": [p.to_jsonable() for p in merged_positions],
                     "daily_maker_rebates": merged_rebates,
                     "last_evaluated_max_by_sk": merged_le,
+                    "consensus_yes_peak_by_pos": merged_peaks,
                 }
                 atomic_write_json(path, payload)
 
@@ -661,6 +700,7 @@ class Portfolio:
                 self.positions = merged_positions
                 self.daily_maker_rebates = merged_rebates
                 self.last_evaluated_max_by_sk = merged_le
+                self.consensus_yes_peak_by_pos = merged_peaks
             finally:
                 fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
 
