@@ -38,6 +38,7 @@ import httpx
 from weather_bot.consensus_yes import (
     detect_and_execute_consensus_yes,
     evaluate_consensus_yes_exits,
+    evaluate_single_consensus_yes_exit,
 )
 from weather_bot.consistency_arb import detect_and_execute_consistency_arb
 from weather_bot.daily_resolver import resolve_settled_events
@@ -394,14 +395,32 @@ async def refresh_events_and_pollers(state: DaemonState) -> None:
         )
     await state.wug_pool.prune(keep=desired)
 
-    # Refresh CLOB WS subscription on the union of NO tokens (Layer 7
-    # + high-bucket NO read no_ask from book_cache).
-    no_tokens = [
-        m.no_token_id for sk in new_events_by_sk
-        for m in new_events_by_sk[sk].markets
-        if m.no_token_id
-    ]
-    await _refresh_ws_subscription(state, no_tokens)
+    # Refresh CLOB WS subscription on the union of:
+    #   - NO tokens (Layer 7 + high-bucket NO read no_ask from book_cache)
+    #   - YES tokens (consensus_yes exits fire on each YES book update,
+    #     so its tokens MUST be in the subscription for sub-second exits)
+    # We subscribe to both YES and NO for every active market — the
+    # bandwidth cost is small and removes any "which side is needed"
+    # state-tracking.
+    sub_tokens: list[str] = []
+    for sk in new_events_by_sk:
+        for m in new_events_by_sk[sk].markets:
+            if m.no_token_id:
+                sub_tokens.append(m.no_token_id)
+            if m.yes_token_id:
+                sub_tokens.append(m.yes_token_id)
+    # Also include YES tokens of any open consensus_yes positions whose
+    # event isn't in the active set anymore (e.g. resolved-soon edge case)
+    open_pos_tokens = {
+        p.token_id for p in state.portfolio.positions
+        if (p.strategy == "consensus_yes"
+            and p.side == "YES"
+            and p.status == "filled")
+    }
+    for tok in open_pos_tokens:
+        if tok and tok not in sub_tokens:
+            sub_tokens.append(tok)
+    await _refresh_ws_subscription(state, sub_tokens)
 
     # V2 conditional preposit — run once per refresh on all events.
     # The function is sync; offload to a thread so we don't block the loop.
@@ -484,6 +503,55 @@ async def refresh_events_and_pollers(state: DaemonState) -> None:
     )
 
 
+def _maybe_fire_consensus_yes_exit(state: "DaemonState", msg: dict) -> None:
+    """Fire the trailing-stop exit check on a single book message.
+
+    Triggered from the WS on_message handler. Sub-second latency from
+    Polymarket book update → exit decision. The function is sync (matches
+    on_message's sync contract); paper-mode submit_order is also sync.
+
+    For a `book` event (full snapshot), the BookCache was just updated
+    with fresh bid/ask values. For a `price_change` delta, BookCache
+    marks the book as invalidated so fresh_best_ask returns None — in
+    that case we skip until the next snapshot.
+    """
+    asset_id = msg.get("asset_id") or msg.get("market")
+    if not asset_id:
+        return
+    # Find any open consensus_yes position on this YES token
+    target_pos = None
+    for p in state.portfolio.positions:
+        if (p.strategy == "consensus_yes"
+                and p.token_id == asset_id
+                and p.side == "YES"
+                and p.status == "filled"):
+            target_pos = p
+            break
+    if target_pos is None:
+        return
+
+    # Pull fresh ask/bid from BookCache. fresh_best_ask returns None if
+    # the book was invalidated by a delta — we skip and wait for the
+    # next `book` snapshot.
+    yes_ask = state.book_cache.fresh_best_ask(asset_id, max_age_seconds=5.0)
+    yes_bid = state.book_cache.fresh_best_bid(asset_id, max_age_seconds=5.0)
+    if yes_ask is None:
+        return
+
+    outcome = evaluate_single_consensus_yes_exit(
+        position=target_pos,
+        yes_ask=yes_ask, yes_bid=yes_bid,
+        client=state.client,
+        portfolio=state.portfolio,
+        portfolio_path=state.args.portfolio_path,
+    )
+    if outcome == "sold":
+        # The exit logger already wrote the detailed record. Emit a
+        # short stdout line for journalctl visibility.
+        print(f"[ws] cons-yes exit fired on {target_pos.station_id} "
+              f"{target_pos.bucket_label} (entry ${target_pos.entry_price:.3f})")
+
+
 async def _refresh_ws_subscription(state: DaemonState, no_tokens: list[str]) -> None:
     """Restart the WS subscription with the current token set. Older
     task is cancelled first; clean cancellation is the priority over
@@ -502,14 +570,17 @@ async def _refresh_ws_subscription(state: DaemonState, no_tokens: list[str]) -> 
         # subscribe_and_watch dispatches each parsed JSON message here
         # SYNCHRONOUSLY (it just calls `on_message(message)`). Keep this
         # fast + non-blocking. Polymarket sometimes batches updates as
-        # a list — handle both.
+        # a list — handle both. After updating the book cache, also fire
+        # consensus_yes exit checks for any tracked YES tokens.
         try:
             if isinstance(msg, list):
                 for sub in msg:
                     if isinstance(sub, dict):
                         state.book_cache.on_book_message(sub)
+                        _maybe_fire_consensus_yes_exit(state, sub)
             elif isinstance(msg, dict):
                 state.book_cache.on_book_message(msg)
+                _maybe_fire_consensus_yes_exit(state, msg)
         except Exception as exc:
             print(f"[ws] on_book_message failed: {exc}", file=sys.stderr)
 

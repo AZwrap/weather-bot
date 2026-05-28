@@ -257,6 +257,125 @@ def _peak_key(token_id: str, side: str) -> str:
     return f"{token_id}|{side}"
 
 
+def evaluate_single_consensus_yes_exit(
+    *,
+    position: Position,
+    yes_ask: float | None,
+    yes_bid: float | None,
+    client: Any,
+    portfolio: Portfolio,
+    portfolio_path: Path = DEFAULT_PORTFOLIO_PATH,
+    min_profit_from_entry: float = MIN_PROFIT_FROM_ENTRY,
+    peak_decline_ticks: float = PEAK_DECLINE_TICKS,
+    log_path: Path = DEFAULT_EXIT_LOG_PATH,
+    verbose: bool = False,
+) -> str:
+    """Evaluate the trailing-stop trigger on a single open consensus_yes
+    position given a fresh (yes_ask, yes_bid) snapshot.
+
+    Returns one of: "peak_updated" | "holding" | "sold" | "no_quote" |
+    "skipped_status" | "submit_failed".
+
+    Designed to be called from the WS book-update callback for sub-second
+    reaction time, AND from the 5-min refresh sweep as a backup.
+    Idempotent: once position.status flips to "filled_closed", subsequent
+    calls return "skipped_status".
+    """
+    if position.strategy != "consensus_yes":
+        return "skipped_status"
+    if position.side != "YES":
+        return "skipped_status"
+    if position.status != "filled":
+        return "skipped_status"
+    if yes_ask is None:
+        return "no_quote"
+
+    key = _peak_key(position.token_id, position.side)
+    peak = portfolio.consensus_yes_peak_by_pos.get(key, position.entry_price)
+
+    if yes_ask > peak:
+        portfolio.consensus_yes_peak_by_pos[key] = float(yes_ask)
+        return "peak_updated"
+
+    decline_below_peak = peak - yes_ask
+    profit_above_entry = yes_ask - position.entry_price
+    if not (decline_below_peak >= peak_decline_ticks
+            and profit_above_entry >= min_profit_from_entry):
+        return "holding"
+
+    # Sell trigger fires. Submit at yes_bid (rounded down to $0.01).
+    sell_target = yes_bid if yes_bid is not None else max(0.01, yes_ask - 0.01)
+    import math
+    limit_sell = max(0.01, math.floor(sell_target * 100) / 100.0)
+
+    signal = TradeSignal(
+        station=STATIONS_BY_ID.get(position.station_id) or _stub_station(position),
+        event_title="", event_slug="",
+        target="max" if "max" in str(position.target_date) else position.bucket_kind,
+        target_date=datetime.fromisoformat(position.target_date).date(),
+        bucket_label=position.bucket_label,
+        bucket_kind=position.bucket_kind,
+        market_id=int(position.market_id),
+        token_id=position.token_id,
+        our_prob=yes_ask, yes_implied=yes_ask,
+        yes_bid=yes_bid, yes_ask=yes_ask,
+        side="YES", edge=0.0,
+        fill_price=limit_sell, volume_24hr=0.0,
+        bias_applied_c=0.0, sigma_ensemble_c=0.0, sigma_total_c=0.0,
+        kelly_full=1.0, position_usd=position.position_usd,
+    )
+    try:
+        result = client.submit_order(
+            signal, order_type="FAK", sdk_side="SELL",
+            limit_price=limit_sell, override_shares=position.shares,
+        )
+    except Exception as exc:
+        _log_exit({
+            "ts_utc": _now_utc_iso(), "result": "submit_exception",
+            "station_id": position.station_id, "token_id": position.token_id,
+            "bucket_label": position.bucket_label, "exc": str(exc)[:200],
+        }, log_path)
+        return "submit_failed"
+    if not result.ok:
+        _log_exit({
+            "ts_utc": _now_utc_iso(), "result": "rejected",
+            "station_id": position.station_id, "token_id": position.token_id,
+            "bucket_label": position.bucket_label,
+            "message": (result.message or "")[:200],
+        }, log_path)
+        return "submit_failed"
+
+    position.status = "filled_closed"
+    try:
+        portfolio.save(portfolio_path)
+    except Exception:
+        pass
+    net_per_share = limit_sell - position.entry_price
+    _log_exit({
+        "ts_utc": _now_utc_iso(), "result": "sold",
+        "station_id": position.station_id,
+        "target_date": position.target_date,
+        "bucket_label": position.bucket_label,
+        "bucket_threshold": position.bucket_threshold,
+        "entry_price": position.entry_price,
+        "peak_yes_ask": peak,
+        "current_yes_ask": yes_ask,
+        "current_yes_bid": yes_bid,
+        "submitted_sell_limit": limit_sell,
+        "fill_price": result.fill_price,
+        "shares": position.shares,
+        "net_per_share_usd": net_per_share,
+        "net_total_usd": net_per_share * position.shares,
+        "order_id": result.order_id,
+        "trigger": "ws_push" if not verbose else "sweep",
+    }, log_path)
+    if verbose:
+        print(f"  [cons-yes-exit] {position.station_id} {position.bucket_label} "
+              f"entry ${position.entry_price:.3f} → peak ${peak:.3f} → "
+              f"sell ${limit_sell:.3f} (net ${net_per_share*position.shares:+.2f})")
+    return "sold"
+
+
 def _log_exit(record: dict, log_path: Path = DEFAULT_EXIT_LOG_PATH) -> None:
     try:
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -277,20 +396,15 @@ def evaluate_consensus_yes_exits(
     log_path: Path = DEFAULT_EXIT_LOG_PATH,
     verbose: bool = False,
 ) -> dict[str, int]:
-    """Walk all open consensus_yes positions, update peak tracker,
-    fire SELL when the trailing-stop trigger fires.
+    """Sweep all open consensus_yes positions. Designed as a periodic
+    backup to the WS-push path — catches any positions whose YES token
+    isn't currently in the WS subscription or whose updates were missed.
 
-    Trigger:
-      current_yes_ask < (peak − peak_decline_ticks)
-      AND current_yes_ask >= entry_price + min_profit_from_entry
-
-    Sells at current_yes_bid (= taker hits the bid). All paper-only
-    under dry-run client.
+    Per-position logic lives in `evaluate_single_consensus_yes_exit`.
     """
     counts: dict[str, int] = defaultdict(int)
-    counts["sold"] = 0
 
-    # Build token_id → current (yes_ask, yes_bid) lookup
+    # Build token_id → current (yes_ask, yes_bid) lookup from events
     quotes: dict[str, tuple[float | None, float | None]] = {}
     for ev in events:
         for m in ev.markets:
@@ -298,108 +412,15 @@ def evaluate_consensus_yes_exits(
                 quotes[m.yes_token_id] = (m.yes_ask, m.yes_bid)
 
     for p in list(portfolio.positions):
-        if p.strategy != "consensus_yes":
-            continue
-        if p.status != "filled":
-            continue
-        if p.side != "YES":
-            continue
         ya, yb = quotes.get(p.token_id, (None, None))
-        if ya is None:
-            counts["skipped_no_quote"] += 1
-            continue
-
-        key = _peak_key(p.token_id, p.side)
-        peak = portfolio.consensus_yes_peak_by_pos.get(key, p.entry_price)
-
-        # Update peak when current_ask climbs
-        if ya > peak:
-            portfolio.consensus_yes_peak_by_pos[key] = float(ya)
-            counts["peak_updated"] += 1
-            continue
-
-        # Trailing-stop trigger
-        decline_below_peak = peak - ya
-        profit_above_entry = ya - p.entry_price
-        if (decline_below_peak >= peak_decline_ticks
-                and profit_above_entry >= min_profit_from_entry):
-            # Submit a SELL YES. Use yes_bid as the achievable price
-            # (taker hits bid); fall back to ya - 0.01 if bid missing.
-            sell_target = yb if yb is not None else max(0.01, ya - 0.01)
-            # Submit at limit = sell_target rounded down to 2 decimals
-            import math
-            limit_sell = max(0.01, math.floor(sell_target * 100) / 100.0)
-
-            signal = TradeSignal(
-                station=STATIONS_BY_ID.get(p.station_id) or _stub_station(p),
-                event_title="", event_slug="",
-                target="max" if "max" in str(p.target_date) else p.bucket_kind,
-                target_date=datetime.fromisoformat(p.target_date).date(),
-                bucket_label=p.bucket_label, bucket_kind=p.bucket_kind,
-                market_id=int(p.market_id), token_id=p.token_id,
-                our_prob=ya, yes_implied=ya,
-                yes_bid=yb, yes_ask=ya,
-                side="YES", edge=0.0,
-                fill_price=limit_sell, volume_24hr=0.0,
-                bias_applied_c=0.0, sigma_ensemble_c=0.0, sigma_total_c=0.0,
-                kelly_full=1.0, position_usd=p.position_usd,
-            )
-            try:
-                result = client.submit_order(
-                    signal, order_type="FAK", sdk_side="SELL",
-                    limit_price=limit_sell, override_shares=p.shares,
-                )
-            except Exception as exc:
-                counts["submit_failed"] += 1
-                _log_exit({
-                    "ts_utc": _now_utc_iso(), "result": "submit_exception",
-                    "station_id": p.station_id, "token_id": p.token_id,
-                    "bucket_label": p.bucket_label, "exc": str(exc)[:200],
-                }, log_path)
-                continue
-            if not result.ok:
-                counts["submit_failed"] += 1
-                _log_exit({
-                    "ts_utc": _now_utc_iso(), "result": "rejected",
-                    "station_id": p.station_id, "token_id": p.token_id,
-                    "bucket_label": p.bucket_label,
-                    "message": (result.message or "")[:200],
-                }, log_path)
-                continue
-
-            # Mark position closed in-memory (no extra dataclass field;
-            # we update status). Real portfolio mark_resolved isn't
-            # appropriate (this is a sell, not a resolution).
-            p.status = "filled_closed"
-            try:
-                portfolio.save(portfolio_path)
-            except Exception:
-                pass
-            counts["sold"] += 1
-            net_per_share = limit_sell - p.entry_price
-            _log_exit({
-                "ts_utc": _now_utc_iso(), "result": "sold",
-                "station_id": p.station_id,
-                "target_date": p.target_date,
-                "bucket_label": p.bucket_label,
-                "bucket_threshold": p.bucket_threshold,
-                "entry_price": p.entry_price,
-                "peak_yes_ask": peak,
-                "current_yes_ask": ya,
-                "current_yes_bid": yb,
-                "submitted_sell_limit": limit_sell,
-                "fill_price": result.fill_price,
-                "shares": p.shares,
-                "net_per_share_usd": net_per_share,
-                "net_total_usd": net_per_share * p.shares,
-                "order_id": result.order_id,
-            }, log_path)
-            if verbose:
-                print(f"  [cons-yes-exit] {p.station_id} {p.bucket_label} "
-                      f"entry ${p.entry_price:.3f} → peak ${peak:.3f} → "
-                      f"sell ${limit_sell:.3f} (net ${net_per_share*p.shares:+.2f})")
-        else:
-            counts["holding"] += 1
+        outcome = evaluate_single_consensus_yes_exit(
+            position=p, yes_ask=ya, yes_bid=yb,
+            client=client, portfolio=portfolio, portfolio_path=portfolio_path,
+            min_profit_from_entry=min_profit_from_entry,
+            peak_decline_ticks=peak_decline_ticks,
+            log_path=log_path, verbose=verbose,
+        )
+        counts[outcome] += 1
 
     return dict(counts)
 
