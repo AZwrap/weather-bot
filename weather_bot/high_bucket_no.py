@@ -12,9 +12,13 @@ certainty doesn't apply — the peak could still drift.
 Difference from Layer 7
 =======================
   - Layer 7 fires when peak >= bucket_high_c → bucket is structurally
-    dead → 99% certain → buy NO at <= $0.99.
-  - This fires when peak + 2 × bucket_width <= bucket_low_c → bucket is
-    probabilistically dead → buy NO at <= ~$0.95.
+    dead (heat has already passed it) → 99% certain → buy NO at ≤ $0.99.
+  - This fires when peak + 2 × bucket_width ≤ bucket_low_c → bucket is
+    probabilistically dead (heat HASN'T reached it AND is unlikely to)
+    → buy NO at ≤ $0.98.
+  - The two strategies cover DISJOINT bucket sets: Layer 7 hits buckets
+    below the peak, this hits buckets above. No overlap, no ceiling
+    handoff — both caps are set independently by EV math.
 
 Configurable
 ============
@@ -71,8 +75,19 @@ MIN_NO_ASK: float = 0.50
 win than not — strong disagreement with our 'too high' thesis. Refuse
 to fire (the market knows something we don't)."""
 
-MAX_NO_ASK: float = 0.95
-"""Above this we're in Layer 7 territory — let Layer 7 handle it."""
+MAX_NO_ASK: float = 0.98
+"""Hard cap on the NO ask we'll pay. High-bucket NO targets buckets
+ABOVE the current peak (heat would need to keep climbing to reach
+them), so Layer 7 — which fires on buckets BELOW the peak — never
+touches these. No handoff at the ceiling; the cap is set by EV math.
+
+At $0.98 NO: +$0.02 if the heat stays below the bucket (we win),
+−$0.98 if it climbs into it. Fee adds ~$0.001. Breakeven win rate
+≈ 98.1%. For buckets 2+ steps above the current peak at the
+station-local trigger hour, that's a stretch but defensible on
+stable stations late in the day. Re-tune after N≥30 paper
+resolutions — the realized hit rate at each entry-price band tells
+us whether 0.98 is too aggressive or if we can push higher."""
 
 DEFAULT_SIZE_USD: float = 5.0
 
