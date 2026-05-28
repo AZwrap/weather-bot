@@ -58,7 +58,7 @@ from weather_bot.polymarket import (
 )
 from weather_bot.polymarket_ws import BookCache, subscribe_and_watch
 from weather_bot.portfolio import DEFAULT_PORTFOLIO_PATH, Portfolio
-from weather_bot.publication_window import midend_local_utc
+from weather_bot.publication_window import midend_local_utc, snapshot_one
 from weather_bot.v2_conditional_preposit import (
     submit_v2_conditional_preposit_orders,
 )
@@ -205,6 +205,22 @@ async def on_wug_update(state: DaemonState, upd: WUGUpdate) -> None:
             print(f"  [hbn] placed={counts['placed']}")
     except Exception as exc:
         print(f"  [hbn] failed: {type(exc).__name__}: {exc}",
+              file=sys.stderr)
+
+    # 4) Publication-window snapshot (post-midend only, idempotent
+    # per (station, target, date, 30-min-offset-bin). snapshot_one
+    # short-circuits BEFORE midend-local — so this is cheap to call
+    # on every WUG tick and only writes when we're in the snapshot
+    # window.
+    try:
+        from datetime import date as _date
+        target_date = _date.fromisoformat(upd.target_date_iso)
+        await snapshot_one(
+            station=station, target=upd.target,
+            target_date=target_date, ev=ev, http=state.http,
+        )
+    except Exception as exc:
+        print(f"  [pub-window] failed: {type(exc).__name__}: {exc}",
               file=sys.stderr)
 
 
