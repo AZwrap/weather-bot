@@ -58,6 +58,7 @@ from weather_bot.polymarket import (
 )
 from weather_bot.polymarket_ws import BookCache, subscribe_and_watch
 from weather_bot.portfolio import DEFAULT_PORTFOLIO_PATH, Portfolio
+from weather_bot.publication_window import midend_local_utc
 from weather_bot.v2_conditional_preposit import (
     submit_v2_conditional_preposit_orders,
 )
@@ -290,17 +291,36 @@ async def refresh_events_and_pollers(state: DaemonState) -> None:
     state.events_by_sk = new_events_by_sk
     state.stations_by_sk = new_stations_by_sk
 
-    # Refresh WUG pollers — only run pollers on today's station-dates
-    # (yesterday's is past midend already; tomorrow's hasn't started).
+    # Refresh WUG pollers — only run pollers for events that are
+    # currently "in flight" in STATION-LOCAL time. The previous version
+    # filtered by today_utc, which silently broke US stations after
+    # 00:00 UTC: their May-27-local target_date no longer matched
+    # May-28-UTC and the poller got reassigned to May-28-local, which
+    # hadn't started yet — Wunderground returned http_400 NDF-0001 for
+    # the entire timezone band west of UTC until the next station-local
+    # midnight rolled in. (Verified empirically 2026-05-28 00:50 UTC.)
+    #
+    # New rule: a poller runs while now_utc is between the start of
+    # the station-local target day and end-of-day-local + 6h (the
+    # 6h trailing window keeps publication-window snapshots flowing
+    # past midend-local — see weather_bot/publication_window.py).
     desired: set[tuple[str, str, str]] = set()
     for sk, station in new_stations_by_sk.items():
         sid, target, td_iso = sk
-        if td_iso != today_utc.isoformat():
+        from datetime import date as _date, timedelta as _td
+        try:
+            target_date = _date.fromisoformat(td_iso)
+        except ValueError:
+            continue
+        midend_utc = midend_local_utc(target_date, station)
+        start_polling = midend_utc - _td(days=1)   # start-of-day in station-local
+        end_polling = midend_utc + _td(hours=6)    # 6h past end-of-day for pub-window
+        if not (start_polling <= now_utc < end_polling):
             continue
         desired.add(sk)
         state.wug_pool.ensure_running(
             station=station, target=target,
-            target_date=today_utc,
+            target_date=target_date,   # actual event date, not today_utc
         )
     await state.wug_pool.prune(keep=desired)
 
