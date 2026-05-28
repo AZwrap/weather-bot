@@ -80,14 +80,27 @@ class WundergroundDaily:
     fetched_at_utc: str
 
 
+def _f_to_c(temp_f: float) -> float:
+    """Convert Fahrenheit to Celsius."""
+    return (float(temp_f) - 32.0) * 5.0 / 9.0
+
+
 def _parse_response(payload: dict[str, Any]) -> tuple[float | None, float | None, int, str | None]:
     """Extract (daily_max_c, daily_min_c, n_obs, last_obs_iso_utc) from
     the api.weather.com historical observations JSON.
 
     The endpoint returns `{"observations": [...]}` where each observation
-    has `valid_time_gmt` (unix), `temp` (Celsius when units=m), `wx_phrase`,
-    etc. We compute the daily extreme from the temp series — Wunderground
-    derives its "high" / "low" the same way.
+    has `valid_time_gmt` (unix), `temp` (numeric value), `wx_phrase`, etc.
+
+    Unit handling: we explicitly request `units=e` (English / Fahrenheit
+    — the native ASOS report unit and Wunderground's US default) and
+    convert F→C here. The `temp_c` / `temp_f` dedicated fields are
+    returned as null by this endpoint, so we can't cross-validate
+    against them — the only signal is the `units` param we sent. That
+    fragility is the reason for explicit F-then-convert: if Wunderground
+    ever changes default behavior, we'd silently treat F as C and the
+    bot would be very wrong. Converting in our code keeps the unit
+    boundary auditable.
     """
     obs = payload.get("observations") if isinstance(payload, dict) else None
     if not isinstance(obs, list) or not obs:
@@ -101,7 +114,7 @@ def _parse_response(payload: dict[str, Any]) -> tuple[float | None, float | None
         if t is None:
             continue
         try:
-            temps_c.append(float(t))
+            temps_c.append(_f_to_c(float(t)))
         except (TypeError, ValueError):
             continue
         try:
@@ -181,7 +194,11 @@ async def fetch_wunderground_daily(
     url = ENDPOINT_TEMPLATE.format(icao=icao.upper())
     params = {
         "apiKey": api_key,
-        "units": "m",       # Celsius
+        # Request Fahrenheit (the native ASOS / Wunderground unit) and
+        # convert to Celsius in _parse_response. See _parse_response's
+        # docstring for the rationale (audit boundary, fail-loud on any
+        # future API behavior change).
+        "units": "e",
         "startDate": ymd_compact,
         "endDate": ymd_compact,
     }
