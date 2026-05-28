@@ -377,7 +377,9 @@ with tabs[4]:
         st.write(f"**{len(hbn)}** high-bucket NO log entries.")
         df = pd.DataFrame(hbn).sort_values("ts_utc", ascending=False).head(50)
         cols = [c for c in ["ts_utc", "result", "station_id", "target", "target_date",
-                            "bucket_label", "no_ask", "no_ask_source",
+                            "bucket_label",
+                            "no_ask_snapshot", "submitted_limit", "fill_price",
+                            "no_ask_source",
                             "observed_extreme_c", "peak_low_c", "peak_high_c",
                             "bucket_low_c", "bucket_high_c", "local_hour"]
                 if c in df.columns]

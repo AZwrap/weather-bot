@@ -298,9 +298,22 @@ def detect_and_execute_guaranteed_buys(
     # us skip buckets we've already evaluated as dead in a prior tick:
     # only buckets whose dead-edge falls between the previously-evaluated
     # extreme and the current observation are candidates.
+    #
+    # Unit handling: last_eval is stored as an INTEGER in the station's
+    # MARKET UNIT (°F for US stations, °C otherwise) — that's what
+    # _rounded_observation produces. bucket_edges_c returns CELSIUS
+    # regardless of market unit. Compare in °C: convert last_eval via
+    # _threshold_to_c. Without this conversion, °F stations (e.g. KMIA
+    # at last_eval=84) compared against high_c in °C (~28.89) always
+    # skip every bucket. Verified bug 2026-05-28.
     from .pnl import _rounded_observation as _round_obs
+    from .obs_distance_filter import _threshold_to_c
     last_eval = portfolio.get_last_evaluated_max(
         station_id, target, target_date_iso,
+    )
+    last_eval_c = (
+        _threshold_to_c(last_eval, station.unit)
+        if last_eval is not None else None
     )
 
     # Find dead buckets in this event, filtered by the progressive
@@ -318,11 +331,13 @@ def detect_and_execute_guaranteed_buys(
         # Progressive filter: skip buckets we already evaluated in a
         # prior WUG tick. For max-target a bucket was already-evaluated
         # if its upper edge ≤ last_eval (we crossed it before). Mirror
-        # for min-target on lower edge.
-        if last_eval is not None:
-            if target == "max" and high_c <= float(last_eval) + 1e-9:
+        # for min-target on lower edge. last_eval_c is in CELSIUS (see
+        # comment above where _threshold_to_c is applied) so the
+        # comparison is unit-correct for both °C and °F stations.
+        if last_eval_c is not None:
+            if target == "max" and high_c <= last_eval_c + 1e-9:
                 continue
-            if target == "min" and low_c >= float(last_eval) - 1e-9:
+            if target == "min" and low_c >= last_eval_c - 1e-9:
                 continue
 
         is_dead = False

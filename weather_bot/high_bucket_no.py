@@ -267,7 +267,15 @@ def detect_and_execute_high_bucket_no(
             counts["skipped_ask_too_low"] += 1
             continue
 
-        shares = size_usd / no_ask
+        # Polymarket only accepts 2-decimal limit prices. We submit at
+        # the CAP (max_no_ask = $0.98) and let the matching engine walk
+        # the book — fills at the cheapest available ask, never above
+        # our limit. Mirrors guaranteed_no_buy.py's hard_cap_price logic.
+        # The actual current no_ask is logged separately for analysis.
+        submitted_limit = round(float(max_no_ask), 2)
+        # Integer shares × 2-decimal limit guarantees a clean maker_amount.
+        shares = float(max(1, int(size_usd / submitted_limit)))
+
         signal = TradeSignal(
             station=station, event_title="", event_slug="",
             target=target, target_date=datetime.fromisoformat(target_date_iso).date(),
@@ -275,7 +283,11 @@ def detect_and_execute_high_bucket_no(
             market_id=int(m.market_id), token_id=m.no_token_id,
             our_prob=1.0 - no_ask, yes_implied=float(m.yes_ask or 0.0),
             yes_bid=m.yes_bid, yes_ask=m.yes_ask,
-            side="NO", edge=1.0 - no_ask, fill_price=no_ask,
+            side="NO", edge=1.0 - no_ask,
+            # fill_price is the EXPECTED fill (= current top-of-book ask).
+            # The signal's fill_price drives share-sizing inside
+            # ExecutionClient.submit_order; we override with shares.
+            fill_price=no_ask,
             volume_24hr=0.0, bias_applied_c=0.0,
             sigma_ensemble_c=0.0, sigma_total_c=0.0,
             kelly_full=1.0, position_usd=size_usd,
@@ -283,7 +295,8 @@ def detect_and_execute_high_bucket_no(
         try:
             result = client.submit_order(
                 signal, order_type="FAK", sdk_side="BUY",
-                limit_price=no_ask,
+                limit_price=submitted_limit,
+                override_shares=shares,
             )
         except Exception as exc:
             counts["submit_failed"] += 1
@@ -332,10 +345,12 @@ def detect_and_execute_high_bucket_no(
             "observed_extreme_c": observed_extreme_c,
             "peak_low_c": peak_low_c, "peak_high_c": peak_high_c,
             "bucket_low_c": low_c, "bucket_high_c": high_c,
-            "no_ask": no_ask, "no_ask_source": no_ask_source,
-            "fill_price": result.fill_price, "shares": shares,
-            "size_usd": size_usd, "order_id": result.order_id,
-            "local_hour": local_h,
+            "no_ask_snapshot": no_ask,        # current book ask at fire time (may be 3 decimals)
+            "no_ask_source": no_ask_source,
+            "submitted_limit": submitted_limit,  # 2-decimal limit we actually submitted
+            "fill_price": result.fill_price,     # actual fill from matching engine
+            "shares": shares, "size_usd": size_usd,
+            "order_id": result.order_id, "local_hour": local_h,
         }, log_path)
 
     return dict(counts)
