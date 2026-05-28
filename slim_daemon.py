@@ -35,10 +35,16 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
 
 import httpx
 
+from weather_bot.consensus_yes import detect_and_execute_consensus_yes
+from weather_bot.consistency_arb import detect_and_execute_consistency_arb
 from weather_bot.exclusions import load_active_exclusions
 from weather_bot.fees import fetch_live_fee_config, warn_if_fee_config_changed
 from weather_bot.guaranteed_no_buy import detect_and_execute_guaranteed_buys
 from weather_bot.high_bucket_no import detect_and_execute_high_bucket_no
+from weather_bot.persistence_tail import (
+    _load_yesterday_actuals,
+    detect_and_execute_persistence_tail,
+)
 from weather_bot.intraday import (
     DEFAULT_INTRADAY_LOG_PATH,
     IntradayDecision,
@@ -103,6 +109,9 @@ class DaemonState:
         self.stations_by_sk: dict[tuple[str, str, str], object] = {}
         self.client = None  # ExecutionClient — see build_client()
         self.intraday_log = load_intraday_log(DEFAULT_INTRADAY_LOG_PATH)
+        # Cached prior-day actuals for persistence_tail. Refreshed on
+        # each events refresh tick from data/forward_log.jsonl.
+        self.yesterday_actuals: dict[tuple[str, str], float] = {}
         self.shutdown_event = asyncio.Event()
         self.ws_task: asyncio.Task | None = None
         self.wug_pool: WUGPollerPool | None = None
@@ -207,7 +216,48 @@ async def on_wug_update(state: DaemonState, upd: WUGUpdate) -> None:
         print(f"  [hbn] failed: {type(exc).__name__}: {exc}",
               file=sys.stderr)
 
-    # 4) Publication-window snapshot (post-midend only, idempotent
+    # 4) Persistence-tail NO — bets against extreme tail buckets
+    # 4+ buckets away from yesterday's actual. Uses the cached
+    # yesterday_actuals dict on state (refreshed each events refresh).
+    try:
+        counts = detect_and_execute_persistence_tail(
+            station_id=upd.station_id,
+            target_date_iso=upd.target_date_iso,
+            target=upd.target,
+            bucket_snapshots=list(ev.markets),
+            client=state.client,
+            portfolio=state.portfolio,
+            portfolio_path=state.args.portfolio_path,
+            yesterday_actuals=state.yesterday_actuals,
+            verbose=False,
+        )
+        if counts and counts.get("placed", 0) > 0:
+            print(f"  [pers-tail] placed={counts['placed']}")
+    except Exception as exc:
+        print(f"  [pers-tail] failed: {type(exc).__name__}: {exc}",
+              file=sys.stderr)
+
+    # 5) Consensus YES momentum — buy the leading mid bucket while it's
+    # in the trade-able band. HIGHEST-RISK strategy in the rebuild —
+    # closest path back to the prior NO_momentum bleed. Paper-only.
+    try:
+        counts = detect_and_execute_consensus_yes(
+            station_id=upd.station_id,
+            target_date_iso=upd.target_date_iso,
+            target=upd.target,
+            bucket_snapshots=list(ev.markets),
+            client=state.client,
+            portfolio=state.portfolio,
+            portfolio_path=state.args.portfolio_path,
+            verbose=False,
+        )
+        if counts and counts.get("placed", 0) > 0:
+            print(f"  [cons-yes] placed={counts['placed']}")
+    except Exception as exc:
+        print(f"  [cons-yes] failed: {type(exc).__name__}: {exc}",
+              file=sys.stderr)
+
+    # 6) Publication-window snapshot (post-midend only, idempotent
     # per (station, target, date, 30-min-offset-bin). snapshot_one
     # short-circuits BEFORE midend-local — so this is cheap to call
     # on every WUG tick and only writes when we're in the snapshot
@@ -349,9 +399,8 @@ async def refresh_events_and_pollers(state: DaemonState) -> None:
     ]
     await _refresh_ws_subscription(state, no_tokens)
 
-    # V2 conditional preposit — run once per refresh on all events
-    # (paper-only via V2_ENABLED=False). The function is sync; offload
-    # to a thread so we don't block the loop.
+    # V2 conditional preposit — run once per refresh on all events.
+    # The function is sync; offload to a thread so we don't block the loop.
     try:
         from concurrent.futures import ThreadPoolExecutor
         loop = asyncio.get_running_loop()
@@ -367,6 +416,30 @@ async def refresh_events_and_pollers(state: DaemonState) -> None:
             )
     except Exception as exc:
         print(f"[v2] failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+
+    # Refresh yesterday_actuals cache for persistence_tail. Reads
+    # data/forward_log.jsonl (~once per 5 min, cheap).
+    try:
+        state.yesterday_actuals = _load_yesterday_actuals()
+    except Exception as exc:
+        print(f"[pers-tail load] failed: {type(exc).__name__}: {exc}",
+              file=sys.stderr)
+
+    # Consistency arb — scans paired (max, min) events for
+    # P(min ≥ T) > P(max ≥ T) violations. Sync, run inline (cheap).
+    try:
+        counts = detect_and_execute_consistency_arb(
+            events=list(new_events_by_sk.values()),
+            client=state.client,
+            portfolio=state.portfolio,
+            portfolio_path=state.args.portfolio_path,
+        )
+        if counts and counts.get("placed", 0) > 0:
+            print(f"[cons-arb] opportunities={counts['placed']} "
+                  f"pairs_scanned={counts.get('pairs_scanned', 0)}")
+    except Exception as exc:
+        print(f"[cons-arb] failed: {type(exc).__name__}: {exc}",
+              file=sys.stderr)
 
     print(
         f"[refresh] {now_utc.isoformat()}  events={len(events)}  "

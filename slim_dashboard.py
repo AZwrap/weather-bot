@@ -33,6 +33,9 @@ LOGS = {
     "layer7_margin_filtered": DATA / "margin_filter_log.jsonl",
     "v2": DATA / "v2_conditional_log.jsonl",
     "hbn": DATA / "high_bucket_no_log.jsonl",
+    "persistence_tail": DATA / "persistence_tail_log.jsonl",
+    "consistency_arb": DATA / "consistency_arb_log.jsonl",
+    "consensus_yes": DATA / "consensus_yes_log.jsonl",
     "publication_window": DATA / "publication_window_log.jsonl",
     "portfolio_audit": DATA / "portfolio_save_audit.jsonl",
 }
@@ -167,6 +170,9 @@ intraday = load_jsonl(str(LOGS["intraday"]))
 layer7 = load_jsonl(str(LOGS["layer7"]))
 v2 = load_jsonl(str(LOGS["v2"]))
 hbn = load_jsonl(str(LOGS["hbn"]))
+pers_tail = load_jsonl(str(LOGS["persistence_tail"]))
+cons_arb = load_jsonl(str(LOGS["consistency_arb"]))
+cons_yes = load_jsonl(str(LOGS["consensus_yes"]))
 pub_window = load_jsonl(str(LOGS["publication_window"]))
 audit = load_jsonl(str(LOGS["portfolio_audit"]))
 
@@ -195,8 +201,8 @@ top[3].metric(
 
 positions = portfolio.get("positions", []) if isinstance(portfolio, dict) else []
 total_fires_today = sum(
-    1 for r in intraday + layer7 + v2 + hbn
-    if (r.get("result") == "filled" or r.get("decision") in ("placed", "BUY_EARLY_TAIL"))
+    1 for r in intraday + layer7 + v2 + hbn + pers_tail + cons_arb + cons_yes
+    if (r.get("result") in ("filled", "opportunity") or r.get("decision") in ("placed", "BUY_EARLY_TAIL"))
     and (r.get("ts_utc") or r.get("scan_time_utc") or "").startswith(
         datetime.now(timezone.utc).strftime("%Y-%m-%d")
     )
@@ -212,6 +218,9 @@ tabs = st.tabs([
     "Layer 7",
     "V2 preposit",
     "High-bucket NO",
+    "Persistence tail",
+    "Consistency arb",
+    "Consensus YES",
     "Publication window",
     "Portfolio",
     "Logs",
@@ -267,7 +276,43 @@ with tabs[0]:
                 "date": r.get("target_date"),
                 "bucket": r.get("bucket_label"),
                 "size_usd": r.get("size_usd"),
-                "reason": f"no_ask=${r.get('no_ask'):.3f}",
+                "reason": f"no_ask=${r.get('no_ask_snapshot') or r.get('no_ask') or 0:.3f}",
+            })
+    for r in pers_tail:
+        if r.get("result") == "filled":
+            rows.append({
+                "strategy": "persistence tail",
+                "ts": r.get("ts_utc"),
+                "station": r.get("station_id"),
+                "target": r.get("target"),
+                "date": r.get("target_date"),
+                "bucket": r.get("bucket_label"),
+                "size_usd": r.get("size_usd"),
+                "reason": f"prior={r.get('prior_c'):.1f}°C, dist={r.get('distance_buckets')}b",
+            })
+    for r in cons_arb:
+        if r.get("result") == "opportunity":
+            rows.append({
+                "strategy": "consistency arb",
+                "ts": r.get("ts_utc"),
+                "station": r.get("station_id"),
+                "target": "—",
+                "date": r.get("target_date"),
+                "bucket": f"T≥{r.get('threshold')}",
+                "size_usd": r.get("size_usd"),
+                "reason": f"margin=${r.get('arb_margin_usd'):.3f}",
+            })
+    for r in cons_yes:
+        if r.get("result") == "filled":
+            rows.append({
+                "strategy": "consensus YES",
+                "ts": r.get("ts_utc"),
+                "station": r.get("station_id"),
+                "target": r.get("target"),
+                "date": r.get("target_date"),
+                "bucket": r.get("bucket_label"),
+                "size_usd": r.get("size_usd"),
+                "reason": f"yes_ask=${r.get('yes_ask_snapshot'):.3f}",
             })
     if rows:
         df = pd.DataFrame(rows).sort_values("ts", ascending=False)
@@ -389,8 +434,76 @@ with tabs[4]:
                 "(or 06:00 for min-target).")
 
 
-# Tab 5 — Publication window
+# Tab 5 — Persistence tail
 with tabs[5]:
+    st.caption("NO on tail buckets 4+ steps away from yesterday's actual.")
+    if pers_tail:
+        filled = [r for r in pers_tail if r.get("result") == "filled"]
+        st.write(f"**{len(filled)}** filled, {len(pers_tail)-len(filled)} non-fill log entries.")
+        if filled:
+            df = pd.DataFrame(filled).sort_values("ts_utc", ascending=False).head(50)
+            cols = [c for c in ["ts_utc", "station_id", "target", "target_date",
+                                "bucket_label", "bucket_kind",
+                                "prior_c", "prior_int", "distance_buckets",
+                                "no_ask_snapshot", "submitted_limit", "fill_price",
+                                "shares", "size_usd"]
+                    if c in df.columns]
+            st.dataframe(df[cols], use_container_width=True, hide_index=True)
+    else:
+        st.info("No persistence-tail fires yet. Strategy needs a prior-day "
+                "actual in data/forward_log.jsonl for the same (station, target). "
+                "First fires land once the resolver populates the prior.")
+
+
+# Tab 6 — Consistency arb
+with tabs[6]:
+    st.caption("Cross-event arb: P(min ≥ T) > P(max ≥ T) is impossible. "
+               "Detect + log when prices violate.")
+    if cons_arb:
+        df = pd.DataFrame(cons_arb).sort_values("ts_utc", ascending=False).head(80)
+        cols = [c for c in ["ts_utc", "station_id", "target_date", "threshold",
+                            "p_max_ge_T", "p_min_ge_T", "cost_usd",
+                            "arb_margin_usd", "n_max_buckets", "n_min_buckets"]
+                if c in df.columns]
+        st.dataframe(df[cols], use_container_width=True, hide_index=True)
+
+        st.subheader("Margin distribution")
+        margins = [r["arb_margin_usd"] for r in cons_arb
+                   if r.get("arb_margin_usd") is not None]
+        if margins:
+            col1, col2, col3 = st.columns(3)
+            col1.metric("N opportunities", len(margins))
+            col2.metric("Median margin", f"${sorted(margins)[len(margins)//2]:.3f}")
+            col3.metric("Max margin", f"${max(margins):.3f}")
+    else:
+        st.info("No consistency-arb opportunities yet. Strategy scans paired "
+                "(max, min) events at every 5-min refresh.")
+
+
+# Tab 7 — Consensus YES
+with tabs[7]:
+    st.warning("⚠️ HIGHEST-RISK strategy in the rebuild. Closest path back "
+               "to the prior NO_momentum bleed. Watch resolved win rate "
+               "closely once N≥10 fires accumulate.")
+    if cons_yes:
+        filled = [r for r in cons_yes if r.get("result") == "filled"]
+        st.write(f"**{len(filled)}** filled, {len(cons_yes)-len(filled)} non-fill log entries.")
+        if filled:
+            df = pd.DataFrame(filled).sort_values("ts_utc", ascending=False).head(50)
+            cols = [c for c in ["ts_utc", "station_id", "target", "target_date",
+                                "bucket_label", "bucket_threshold",
+                                "yes_ask_snapshot", "submitted_limit", "fill_price",
+                                "second_yes_ask", "n_mids_in_event",
+                                "shares", "size_usd"]
+                    if c in df.columns]
+            st.dataframe(df[cols], use_container_width=True, hide_index=True)
+    else:
+        st.info("No consensus-YES fires yet. Strategy fires when the leading "
+                "mid bucket's yes_ask is in [$0.40, $0.85].")
+
+
+# Tab 8 — Publication window
+with tabs[8]:
     if pub_window:
         st.write(f"**{len(pub_window)}** publication-window snapshots.")
         df = pd.DataFrame([
@@ -427,7 +540,7 @@ with tabs[5]:
 
 
 # Tab 6 — Portfolio
-with tabs[6]:
+with tabs[9]:
     if isinstance(portfolio, dict) and portfolio.get("positions"):
         pos = portfolio["positions"]
         st.write(f"**{len(pos)}** synthetic positions (paper, dry_run=True).")
@@ -467,7 +580,7 @@ with tabs[6]:
 
 
 # Tab 7 — Logs
-with tabs[7]:
+with tabs[10]:
     n_lines = st.slider("Lines to show", min_value=50, max_value=1000,
                         value=200, step=50)
     grep_filter = st.text_input("Filter (substring match)", value="")
