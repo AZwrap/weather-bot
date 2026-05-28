@@ -94,7 +94,24 @@ sudo sed -i \
 
 sudo systemctl daemon-reload
 sudo systemctl enable slim-daemon.service
-echo "==> Enabled. Start with:  sudo systemctl start slim-daemon"
+echo "==> Enabled slim-daemon. Start with:  sudo systemctl start slim-daemon"
+
+# ── 7b. Install dashboard systemd unit ────────────────────────────────
+DASH_SRC="$PROJECT_DIR/deploy/slim-dashboard.service"
+DASH_DST="/etc/systemd/system/slim-dashboard.service"
+
+if [[ -f "$DASH_SRC" ]]; then
+  echo "==> Installing $DASH_DST…"
+  sudo cp "$DASH_SRC" "$DASH_DST"
+  sudo sed -i \
+    -e "s|/USER|$RUN_USER|g" \
+    -e "s|/PROJECT_PATH/Weather_Bot|$PROJECT_DIR|g" \
+    "$DASH_DST"
+  sudo systemctl daemon-reload
+  sudo systemctl enable slim-dashboard.service
+  echo "==> Enabled slim-dashboard. Start with:  sudo systemctl start slim-dashboard"
+  echo "    Reach via SSH tunnel: ssh -L 8501:localhost:8501 <vps-alias>"
+fi
 
 # ── 8. Verification cheatsheet ────────────────────────────────────────
 cat <<EOF
