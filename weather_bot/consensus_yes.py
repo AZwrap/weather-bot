@@ -65,16 +65,36 @@ much cheaper had it fired. Skip."""
 
 DEFAULT_SIZE_USD: float = 5.0
 
-# Exit (trailing-stop) parameters
-MIN_PROFIT_FROM_ENTRY: float = 0.05
-"""Sell only once current_ask is at least 5pp above entry price.
-Below this we hold even on declines (would be a loss after fees)."""
+# ── Exit logic: ratcheting 5¢-grid floor + hard stop ──────────────────
+# Per user spec (2026-05-29): a moving floor that snaps up in 5¢ steps
+# as the bid rises, selling when the bid crosses below it. Plus a hard
+# stop below entry so a never-profits position doesn't ride to a full
+# loss at resolution.
+#
+# The trailing stop tracks the BID (the price we actually sell into) —
+# measuring on the ask would let a "+profit on ask" realize as a loss
+# on the bid when books are wide.
 
+FLOOR_GRID: float = 0.05
+"""Floor granularity. The ratchet floor = peak_bid rounded DOWN to the
+nearest FLOOR_GRID. peak $0.57 → floor $0.55; peak $0.63 → floor $0.60."""
+
+RATCHET_ARM: float = 0.05
+"""The profit ratchet only ARMS once peak_bid ≥ entry + RATCHET_ARM
+(one grid step of genuine profit). Until armed, only the hard stop is
+active — this prevents a knee-jerk sell right at entry on entry-noise.
+After arming, the floor trails the peak and only moves up."""
+
+HARD_STOP_BUFFER: float = 0.10
+"""Hard stop: sell if bid ≤ entry − HARD_STOP_BUFFER, regardless of
+ratchet state. Caps the held-to-resolution tail (a consensus bucket
+that's wrong marches to a $0 resolution = full ~$5 loss without this).
+At $0.10 a stopped-out loser costs ~10¢/share instead of the full
+entry price."""
+
+# Legacy names kept for any external import; no longer drive the logic.
+MIN_PROFIT_FROM_ENTRY: float = RATCHET_ARM
 PEAK_DECLINE_TICKS: float = 0.01
-"""Minimum decline below the peak (in $) before we treat a drop as
-'turning down'. Default $0.01 = one tick of Polymarket's price grid.
-Lower = more sensitive (faster exits, less profit per fire).
-Higher = need a larger drawdown before triggering."""
 
 
 def _now_utc_iso() -> str:
@@ -265,34 +285,39 @@ def evaluate_single_consensus_yes_exit(
     client: Any,
     portfolio: Portfolio,
     portfolio_path: Path = DEFAULT_PORTFOLIO_PATH,
-    min_profit_from_entry: float = MIN_PROFIT_FROM_ENTRY,
-    peak_decline_ticks: float = PEAK_DECLINE_TICKS,
+    floor_grid: float = FLOOR_GRID,
+    ratchet_arm: float = RATCHET_ARM,
+    hard_stop_buffer: float = HARD_STOP_BUFFER,
     log_path: Path = DEFAULT_EXIT_LOG_PATH,
     trigger: str = "ws_push",
     verbose: bool = False,
 ) -> str:
-    """Evaluate the trailing-stop trigger on a single open consensus_yes
-    position given a fresh (yes_ask, yes_bid) snapshot.
+    """Evaluate the ratcheting-floor + hard-stop exit on a single open
+    consensus_yes position given a fresh (yes_ask, yes_bid) snapshot.
 
-    Returns one of: "peak_updated" | "holding" | "sold" | "no_quote" |
+    Exit logic (per user spec 2026-05-29):
+      - Track peak_bid (highest bid since entry).
+      - Profit ratchet: once peak_bid ≥ entry + ratchet_arm, a floor sits
+        at peak_bid rounded DOWN to floor_grid (e.g. peak 0.63 → 0.60).
+        It only moves up. Sell when bid < floor.
+      - Hard stop (always on): sell when bid ≤ entry − hard_stop_buffer.
+      - Fill at the bid (the price we cross down through).
+
+    Returns: "peak_updated" | "holding" | "sold" | "no_quote" |
     "skipped_status" | "submit_failed".
 
-    Designed to be called from the WS book-update callback for sub-second
-    reaction time, AND from the 5-min refresh sweep as a backup.
-    Idempotent: once position.status flips to "filled_closed", subsequent
-    calls return "skipped_status".
+    Called from the WS book-update callback (sub-second) AND the 5-min
+    sweep (backup). Idempotent once status → "filled_closed".
     """
+    import math
+
     if position.strategy != "consensus_yes":
         return "skipped_status"
     if position.side != "YES":
         return "skipped_status"
     if position.status != "filled":
         return "skipped_status"
-    # Track the trailing stop on the BID — that's the price we actually
-    # sell into. Measuring profit/peak on the ASK (the old bug) meant a
-    # "+5pp on ask" could realize as a LOSS on the bid when the book was
-    # wide (ask 0.55 / bid 0.49). Using the bid guarantees that when we
-    # fire, the realized exit price is genuinely ≥ entry + min_profit.
+    # Track on the BID — the price we actually sell into.
     if yes_bid is None:
         return "no_quote"
 
@@ -300,18 +325,31 @@ def evaluate_single_consensus_yes_exit(
     peak = portfolio.consensus_yes_peak_by_pos.get(key, position.entry_price)
 
     if yes_bid > peak:
-        portfolio.consensus_yes_peak_by_pos[key] = float(yes_bid)
-        return "peak_updated"
+        peak = float(yes_bid)
+        portfolio.consensus_yes_peak_by_pos[key] = peak
 
-    decline_below_peak = peak - yes_bid
-    profit_above_entry = yes_bid - position.entry_price
-    if not (decline_below_peak >= peak_decline_ticks
-            and profit_above_entry >= min_profit_from_entry):
+    entry = position.entry_price
+
+    # Hard stop — always active.
+    hard_stop_level = entry - hard_stop_buffer
+    hard_stop_hit = yes_bid <= hard_stop_level
+
+    # Profit ratchet — arms only once peak rose ≥ ratchet_arm above entry.
+    ratchet_armed = peak >= entry + ratchet_arm
+    ratchet_floor = None
+    ratchet_hit = False
+    if ratchet_armed:
+        # peak rounded DOWN to the floor grid (round() clears float dust)
+        ratchet_floor = round(math.floor((peak + 1e-9) / floor_grid) * floor_grid, 2)
+        ratchet_hit = yes_bid < ratchet_floor
+
+    if not (hard_stop_hit or ratchet_hit):
         return "holding"
 
-    # Sell trigger fires. Submit at yes_bid (rounded down to $0.01) —
-    # same price the trigger was evaluated on.
-    import math
+    which = "hard_stop" if hard_stop_hit and not ratchet_hit else (
+        "ratchet_floor" if ratchet_hit and not hard_stop_hit else "both")
+
+    # Sell at the current bid (rounded down to $0.01).
     limit_sell = max(0.01, math.floor(yes_bid * 100) / 100.0)
 
     signal = TradeSignal(
@@ -364,7 +402,10 @@ def evaluate_single_consensus_yes_exit(
         "bucket_label": position.bucket_label,
         "bucket_threshold": position.bucket_threshold,
         "entry_price": position.entry_price,
-        "peak_yes_bid": peak,            # trailing stop tracks the BID now
+        "peak_yes_bid": peak,            # trailing stop tracks the BID
+        "exit_reason": which,            # "ratchet_floor" | "hard_stop" | "both"
+        "ratchet_floor": ratchet_floor,  # None if ratchet never armed
+        "hard_stop_level": hard_stop_level,
         "current_yes_ask": yes_ask,
         "current_yes_bid": yes_bid,
         "submitted_sell_limit": limit_sell,
@@ -397,8 +438,6 @@ def evaluate_consensus_yes_exits(
     client: Any,
     portfolio: Portfolio,
     portfolio_path: Path = DEFAULT_PORTFOLIO_PATH,
-    min_profit_from_entry: float = MIN_PROFIT_FROM_ENTRY,
-    peak_decline_ticks: float = PEAK_DECLINE_TICKS,
     log_path: Path = DEFAULT_EXIT_LOG_PATH,
     verbose: bool = False,
 ) -> dict[str, int]:
@@ -422,8 +461,6 @@ def evaluate_consensus_yes_exits(
         outcome = evaluate_single_consensus_yes_exit(
             position=p, yes_ask=ya, yes_bid=yb,
             client=client, portfolio=portfolio, portfolio_path=portfolio_path,
-            min_profit_from_entry=min_profit_from_entry,
-            peak_decline_ticks=peak_decline_ticks,
             log_path=log_path, trigger="sweep", verbose=verbose,
         )
         counts[outcome] += 1
