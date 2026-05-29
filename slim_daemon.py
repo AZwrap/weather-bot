@@ -120,6 +120,7 @@ class DaemonState:
         self.shutdown_event = asyncio.Event()
         self.ws_task: asyncio.Task | None = None
         self.wug_pool: WUGPollerPool | None = None
+        self.resolver_task: asyncio.Task | None = None
 
 
 def build_client(live: bool):
@@ -481,26 +482,57 @@ async def refresh_events_and_pollers(state: DaemonState) -> None:
         print(f"[cons-yes-exit] failed: {type(exc).__name__}: {exc}",
               file=sys.stderr)
 
-    # Daily resolver — fetch WUG actuals for events past midend-local
-    # + 2h grace, append to data/forward_log.jsonl. Feeds
-    # persistence_tail's priors + the publication-window analyzer.
-    try:
-        res_counts = await resolve_settled_events(
-            events_by_sk=new_events_by_sk,
-            stations_by_sk=new_stations_by_sk,
-            http=state.http,
-        )
-        if res_counts.get("resolved", 0) > 0 or res_counts.get("skipped_no_data", 0) > 0:
-            print(f"[resolver] {res_counts}")
-    except Exception as exc:
-        print(f"[resolver] failed: {type(exc).__name__}: {exc}",
-              file=sys.stderr)
+    # NOTE: the daily resolver used to run HERE, inside every 5-min
+    # refresh. It does 50+ sequential 1/sec-throttled WUG fetches, so
+    # it blocked refresh for ~5-6 min AND re-fetched the same
+    # resolutions every 5 min (6472 audit lines / 23h). It now runs as
+    # its own background task on a 30-min cadence — see
+    # _resolver_loop() spawned in main_async. Resolutions only update
+    # once/day so 30 min is plenty.
 
     print(
         f"[refresh] {now_utc.isoformat()}  events={len(events)}  "
         f"active_sk={len(new_events_by_sk)}  wug_pollers={len(state.wug_pool.keys())}  "
         f"ws_tokens={len(sub_tokens)}"
     )
+
+
+async def _resolver_loop(state: "DaemonState", interval_s: float = 1800.0) -> None:
+    """Background daily-resolver loop. Runs every `interval_s` (default
+    30 min). Resolutions only change once per station per day, so a
+    tight cadence just wastes WUG calls — 30 min catches each station
+    within half an hour of its midend+grace window opening.
+
+    Runs independently of refresh_events_and_pollers so the resolver's
+    50+ sequential throttled WUG fetches never block the main loop or
+    the WUG pollers. Reads the latest events/stations snapshot off
+    `state` (populated by the most recent refresh).
+    """
+    while not state.shutdown_event.is_set():
+        try:
+            if state.events_by_sk:
+                res_counts = await resolve_settled_events(
+                    events_by_sk=state.events_by_sk,
+                    stations_by_sk=state.stations_by_sk,
+                    http=state.http,
+                )
+                if res_counts.get("resolved", 0) > 0:
+                    print(f"[resolver] {res_counts}")
+                    # A fresh resolution means persistence_tail has a new
+                    # prior — refresh the cached yesterday_actuals.
+                    try:
+                        state.yesterday_actuals = _load_yesterday_actuals()
+                    except Exception:
+                        pass
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(f"[resolver] loop failed: {type(exc).__name__}: {exc}",
+                  file=sys.stderr)
+        try:
+            await asyncio.wait_for(state.shutdown_event.wait(), timeout=interval_s)
+        except asyncio.TimeoutError:
+            pass
 
 
 def _maybe_fire_consensus_yes_exit(state: "DaemonState", msg: dict) -> None:
@@ -641,6 +673,13 @@ async def main_async() -> int:
                   file=sys.stderr)
             traceback.print_exc()
 
+        # Spawn the daily resolver as its own background task (30-min
+        # cadence) so its slow throttled WUG fetches never block the
+        # main loop or the WUG pollers.
+        state.resolver_task = asyncio.create_task(
+            _resolver_loop(state), name="daily-resolver",
+        )
+
         # Main loop: periodic refresh + kill-switch + signal poll
         last_refresh = datetime.now(timezone.utc)
         try:
@@ -666,12 +705,18 @@ async def main_async() -> int:
                 except asyncio.TimeoutError:
                     pass
         finally:
-            print("[daemon] stopping pollers + WS subscription")
+            print("[daemon] stopping pollers + WS subscription + resolver")
             await state.wug_pool.stop_all()
             if state.ws_task is not None and not state.ws_task.done():
                 state.ws_task.cancel()
                 try:
                     await asyncio.wait_for(state.ws_task, timeout=5.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    pass
+            if state.resolver_task is not None and not state.resolver_task.done():
+                state.resolver_task.cancel()
+                try:
+                    await asyncio.wait_for(state.resolver_task, timeout=5.0)
                 except (asyncio.CancelledError, asyncio.TimeoutError):
                     pass
             try:
