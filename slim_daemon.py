@@ -499,7 +499,7 @@ async def refresh_events_and_pollers(state: DaemonState) -> None:
     print(
         f"[refresh] {now_utc.isoformat()}  events={len(events)}  "
         f"active_sk={len(new_events_by_sk)}  wug_pollers={len(state.wug_pool.keys())}  "
-        f"ws_tokens={len(no_tokens)}"
+        f"ws_tokens={len(sub_tokens)}"
     )
 
 
@@ -628,7 +628,18 @@ async def main_async() -> int:
             callback=_callback, http=http, interval_s=args.wug_poll_interval,
         )
 
-        await refresh_events_and_pollers(state)
+        # Startup refresh — wrapped so any error here can't prevent the
+        # daemon from entering its main loop (where the in-loop refresh
+        # retries every events_refresh_interval). A bare crash here was
+        # the 2026-05-29 NameError crash-loop: the daemon never reached
+        # the main loop, restarting every ~6 min (= resolver runtime).
+        try:
+            await refresh_events_and_pollers(state)
+        except Exception as exc:
+            import traceback
+            print(f"[startup-refresh] failed: {type(exc).__name__}: {exc}",
+                  file=sys.stderr)
+            traceback.print_exc()
 
         # Main loop: periodic refresh + kill-switch + signal poll
         last_refresh = datetime.now(timezone.utc)
