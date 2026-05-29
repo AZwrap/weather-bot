@@ -567,7 +567,9 @@ def _maybe_fire_consensus_yes_exit(state: "DaemonState", msg: dict) -> None:
     # next `book` snapshot.
     yes_ask = state.book_cache.fresh_best_ask(asset_id, max_age_seconds=5.0)
     yes_bid = state.book_cache.fresh_best_bid(asset_id, max_age_seconds=5.0)
-    if yes_ask is None:
+    # Exit trigger evaluates on the bid (the price we sell into), so the
+    # bid is what we require here.
+    if yes_bid is None:
         return
 
     outcome = evaluate_single_consensus_yes_exit(
@@ -576,6 +578,7 @@ def _maybe_fire_consensus_yes_exit(state: "DaemonState", msg: dict) -> None:
         client=state.client,
         portfolio=state.portfolio,
         portfolio_path=state.args.portfolio_path,
+        trigger="ws_push",
     )
     if outcome == "sold":
         # The exit logger already wrote the detailed record. Emit a

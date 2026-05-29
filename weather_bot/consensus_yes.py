@@ -268,6 +268,7 @@ def evaluate_single_consensus_yes_exit(
     min_profit_from_entry: float = MIN_PROFIT_FROM_ENTRY,
     peak_decline_ticks: float = PEAK_DECLINE_TICKS,
     log_path: Path = DEFAULT_EXIT_LOG_PATH,
+    trigger: str = "ws_push",
     verbose: bool = False,
 ) -> str:
     """Evaluate the trailing-stop trigger on a single open consensus_yes
@@ -287,26 +288,31 @@ def evaluate_single_consensus_yes_exit(
         return "skipped_status"
     if position.status != "filled":
         return "skipped_status"
-    if yes_ask is None:
+    # Track the trailing stop on the BID — that's the price we actually
+    # sell into. Measuring profit/peak on the ASK (the old bug) meant a
+    # "+5pp on ask" could realize as a LOSS on the bid when the book was
+    # wide (ask 0.55 / bid 0.49). Using the bid guarantees that when we
+    # fire, the realized exit price is genuinely ≥ entry + min_profit.
+    if yes_bid is None:
         return "no_quote"
 
     key = _peak_key(position.token_id, position.side)
     peak = portfolio.consensus_yes_peak_by_pos.get(key, position.entry_price)
 
-    if yes_ask > peak:
-        portfolio.consensus_yes_peak_by_pos[key] = float(yes_ask)
+    if yes_bid > peak:
+        portfolio.consensus_yes_peak_by_pos[key] = float(yes_bid)
         return "peak_updated"
 
-    decline_below_peak = peak - yes_ask
-    profit_above_entry = yes_ask - position.entry_price
+    decline_below_peak = peak - yes_bid
+    profit_above_entry = yes_bid - position.entry_price
     if not (decline_below_peak >= peak_decline_ticks
             and profit_above_entry >= min_profit_from_entry):
         return "holding"
 
-    # Sell trigger fires. Submit at yes_bid (rounded down to $0.01).
-    sell_target = yes_bid if yes_bid is not None else max(0.01, yes_ask - 0.01)
+    # Sell trigger fires. Submit at yes_bid (rounded down to $0.01) —
+    # same price the trigger was evaluated on.
     import math
-    limit_sell = max(0.01, math.floor(sell_target * 100) / 100.0)
+    limit_sell = max(0.01, math.floor(yes_bid * 100) / 100.0)
 
     signal = TradeSignal(
         station=STATIONS_BY_ID.get(position.station_id) or _stub_station(position),
@@ -358,7 +364,7 @@ def evaluate_single_consensus_yes_exit(
         "bucket_label": position.bucket_label,
         "bucket_threshold": position.bucket_threshold,
         "entry_price": position.entry_price,
-        "peak_yes_ask": peak,
+        "peak_yes_bid": peak,            # trailing stop tracks the BID now
         "current_yes_ask": yes_ask,
         "current_yes_bid": yes_bid,
         "submitted_sell_limit": limit_sell,
@@ -367,7 +373,7 @@ def evaluate_single_consensus_yes_exit(
         "net_per_share_usd": net_per_share,
         "net_total_usd": net_per_share * position.shares,
         "order_id": result.order_id,
-        "trigger": "ws_push" if not verbose else "sweep",
+        "trigger": trigger,
     }, log_path)
     if verbose:
         print(f"  [cons-yes-exit] {position.station_id} {position.bucket_label} "
@@ -418,7 +424,7 @@ def evaluate_consensus_yes_exits(
             client=client, portfolio=portfolio, portfolio_path=portfolio_path,
             min_profit_from_entry=min_profit_from_entry,
             peak_decline_ticks=peak_decline_ticks,
-            log_path=log_path, verbose=verbose,
+            log_path=log_path, trigger="sweep", verbose=verbose,
         )
         counts[outcome] += 1
 

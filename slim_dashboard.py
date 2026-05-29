@@ -514,9 +514,9 @@ with tabs[7]:
         st.write(f"**{len(sold)}** sold, {len(cons_yes_exit)-len(sold)} non-sell log entries.")
         if sold:
             df = pd.DataFrame(sold).sort_values("ts_utc", ascending=False).head(50)
-            cols = [c for c in ["ts_utc", "station_id", "bucket_label",
-                                "entry_price", "peak_yes_ask",
-                                "current_yes_ask", "submitted_sell_limit",
+            cols = [c for c in ["ts_utc", "trigger", "station_id", "bucket_label",
+                                "entry_price", "peak_yes_bid",
+                                "current_yes_bid", "submitted_sell_limit",
                                 "fill_price", "shares",
                                 "net_per_share_usd", "net_total_usd"]
                     if c in df.columns]
