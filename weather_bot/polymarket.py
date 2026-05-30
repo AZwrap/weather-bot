@@ -490,14 +490,24 @@ def simulate_buy_fill(
 ) -> tuple[float, float, bool] | None:
     """Simulate a marketable BUY (FAK) against the ask ladder.
 
-    Walks the asks at price ≤ limit_price, cheapest first, consuming up
-    to size_usd. Returns (avg_fill_price, filled_shares, fully_filled),
-    or None if there isn't enough depth at acceptable prices to clear
-    the exchange minimum order size.
+    Behaviour (matches the operator's scaling spec):
+      1. Walk the asks CHEAPEST-FIRST, consuming each level fully before
+         moving to the next.
+      2. STOP at `limit_price` — levels priced above it (where the trade
+         turns negative-EV) are never touched.
+      3. STOP when `size_usd` is filled. If depth runs out below the
+         limit first, it's a PARTIAL fill (fully_filled=False) — e.g. a
+         $20 target that only finds $11 of profitable depth fills $11.
+      4. DROP (return None) if the fillable size below the limit is under
+         the exchange minimum order size (`min_order_size`, default 5
+         shares). "If the minimum can't be completed, drop the trade."
 
-    This is what makes paper fills HONEST: instead of assuming the whole
-    order clears at top-of-book, it reflects the depth-walked average a
-    real FAK would get (and flags partial fills via fully_filled=False).
+    Returns (avg_fill_price, filled_shares, fully_filled) or None.
+
+    This makes paper fills HONEST and makes size-scaling safe: bumping
+    size_usd to $20 will fill only the profitable depth (partial when
+    that's less than the target) and drop when it can't even clear the
+    5-share minimum, never pushing the order into negative-EV levels.
     """
     if depth is None or not depth.asks:
         return None
