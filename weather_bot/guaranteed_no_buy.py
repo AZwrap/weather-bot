@@ -220,6 +220,7 @@ def detect_and_execute_guaranteed_buys(
     # truest "now" price for the ≤$0.98 cap check.
     book_cache: Any = None,         # BookCache | None
     ws_max_age_seconds: float = 5.0,
+    depth_map: dict | None = None,  # token_id -> OrderBookDepth (REST ladder)
 ) -> dict[str, int]:
     """For (station_id, target_date_iso, target), find structurally-dead
     buckets and submit FAK BUY NO at market ask (capped at hard_cap_price).
@@ -678,6 +679,26 @@ def detect_and_execute_guaranteed_buys(
         # Integer share count, at least 1, at most effective_size_usd / price floor
         size_shares_target = float(effective_size_usd) / limit_price_clean
         size_shares = float(max(1, int(size_shares_target)))
+
+        # DEPTH-AWARE FILL (paper realism). Walk the NO ask ladder up to
+        # the cap to get the realistic avg fill price. Layer 7 is mostly
+        # fill-starved (no NO offers on dead buckets) — when depth IS
+        # present, this records what a real FAK would pay rather than the
+        # optimistic top-of-book no_ask. We keep size_shares as the
+        # integer FAK count; only the recorded fill PRICE is corrected.
+        depth_source = "top_of_book"
+        fully_filled = True
+        if depth_map is not None:
+            from weather_bot.polymarket import simulate_buy_fill
+            _depth = depth_map.get(market.no_token_id)
+            _sim = simulate_buy_fill(_depth, effective_size_usd, limit_price_clean)
+            if _sim is None:
+                counts["skipped_no_depth"] += 1
+                release_cap_token(effective_size_usd, station_id=station_id)
+                continue
+            _fill_avg, _walked_shares, fully_filled = _sim
+            signal.fill_price = _fill_avg     # propagates into dry-run OrderResult
+            depth_source = "depth_walk"
         # Sanity-check: verify maker_amount is clean
         maker_amount_check = round(size_shares * limit_price_clean, 4)
         if abs(maker_amount_check - round(maker_amount_check, 2)) > 1e-6:
@@ -987,6 +1008,8 @@ def detect_and_execute_guaranteed_buys(
             "cap_price": hard_cap_price,
             "order_id": result.order_id,
             "fast_path": used_presigned,  # True if broadcast pre-signed (saves ~200ms)
+            "depth_source": depth_source,    # "depth_walk" | "top_of_book"
+            "fully_filled": fully_filled,    # False = depth ran out, partial fill
             "result": "filled",
         }, log_path)
 

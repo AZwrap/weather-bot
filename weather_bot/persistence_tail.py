@@ -138,6 +138,7 @@ def detect_and_execute_persistence_tail(
     size_usd: float = DEFAULT_SIZE_USD,
     log_path: Path = DEFAULT_LOG_PATH,
     yesterday_actuals: dict[tuple[str, str], float] | None = None,
+    depth_map: dict | None = None,
     verbose: bool = False,
 ) -> dict[str, int]:
     """Fire NO on tail buckets that are N_BUCKETS_MIN_DISTANCE+ steps
@@ -223,10 +224,24 @@ def detect_and_execute_persistence_tail(
             counts["skipped_ask_too_low"] += 1
             continue
 
-        # Submit at the 2-decimal cap; matching engine walks the book
-        # cheapest first (same pattern as Layer 7 / HBN).
+        # Submit at the 2-decimal cap; matching engine walks the book.
         submitted_limit = round(float(max_no_ask), 2)
-        shares = float(max(1, int(size_usd / submitted_limit)))
+
+        # DEPTH-AWARE FILL — walk the NO ask ladder up to the limit.
+        from .polymarket import simulate_buy_fill
+        depth = (depth_map or {}).get(m.no_token_id)
+        sim = simulate_buy_fill(depth, size_usd, submitted_limit)
+        if sim is None:
+            if depth_map is not None:
+                counts["skipped_no_depth"] += 1
+                continue
+            fill_avg = no_ask
+            shares = float(max(1, int(size_usd / submitted_limit)))
+            fully_filled = True
+            depth_source = "top_of_book_fallback"
+        else:
+            fill_avg, shares, fully_filled = sim
+            depth_source = "depth_walk"
 
         signal = TradeSignal(
             station=station, event_title="", event_slug="",
@@ -237,9 +252,9 @@ def detect_and_execute_persistence_tail(
             our_prob=1.0 - no_ask, yes_implied=float(m.yes_ask or 0.0),
             yes_bid=m.yes_bid, yes_ask=m.yes_ask,
             side="NO", edge=1.0 - no_ask,
-            fill_price=no_ask, volume_24hr=0.0,
+            fill_price=fill_avg, volume_24hr=0.0,
             bias_applied_c=0.0, sigma_ensemble_c=0.0, sigma_total_c=0.0,
-            kelly_full=1.0, position_usd=size_usd,
+            kelly_full=1.0, position_usd=fill_avg * shares,
         )
         try:
             result = client.submit_order(
@@ -274,7 +289,7 @@ def detect_and_execute_persistence_tail(
             market_id=int(m.market_id), bucket_label=m.bucket_label,
             bucket_kind=kind, bucket_threshold=int(thr),
             target_date=target_date_iso,
-            shares=shares, entry_price=no_ask, position_usd=size_usd,
+            shares=shares, entry_price=fill_avg, position_usd=fill_avg * shares,
             submitted_at=_now_utc_iso(), status="filled",
             order_id=result.order_id, strategy="persistence_tail",
         )
@@ -296,7 +311,9 @@ def detect_and_execute_persistence_tail(
             "no_ask_snapshot": no_ask,
             "submitted_limit": submitted_limit,
             "fill_price": result.fill_price,
-            "shares": shares, "size_usd": size_usd,
+            "depth_source": depth_source,
+            "fully_filled": fully_filled,
+            "shares": shares, "size_usd": fill_avg * shares,
             "order_id": result.order_id,
         }, log_path)
 

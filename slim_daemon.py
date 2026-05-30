@@ -174,6 +174,28 @@ async def on_wug_update(state: DaemonState, upd: WUGUpdate) -> None:
         f"prev={upd.previous_int}, n={upd.n_observations})"
     )
 
+    # DEPTH PRE-FETCH. on_wug_update only fires on OUTWARD extreme moves
+    # (not every poll tick), so fetching the event's full order books
+    # here is bounded. The depth_map feeds the taker strategies so paper
+    # fills reflect the depth-walked average, not an optimistic
+    # top-of-book full fill. Fetch both NO and YES tokens (NO strategies
+    # + consensus_yes). Best-effort: on failure depth_map is empty and
+    # strategies record skipped_no_depth.
+    depth_map: dict = {}
+    try:
+        from weather_bot.polymarket import fetch_orderbook_depths_batch
+        tokens = []
+        for m in ev.markets:
+            if m.no_token_id:
+                tokens.append(m.no_token_id)
+            if m.yes_token_id:
+                tokens.append(m.yes_token_id)
+        if tokens:
+            depth_map = await fetch_orderbook_depths_batch(tokens, state.http)
+    except Exception as exc:
+        print(f"  [depth] fetch failed: {type(exc).__name__}: {exc}",
+              file=sys.stderr)
+
     # 1) Lock-in YES — if a tail bucket just locked in, fire YES on it.
     try:
         await _run_lockin_yes(state, station, ev, upd)
@@ -193,6 +215,7 @@ async def on_wug_update(state: DaemonState, upd: WUGUpdate) -> None:
             portfolio=state.portfolio,
             portfolio_path=state.args.portfolio_path,
             book_cache=state.book_cache,
+            depth_map=depth_map,
             verbose=False,
         )
         if counts and counts.get("placed", 0) > 0:
@@ -214,6 +237,7 @@ async def on_wug_update(state: DaemonState, upd: WUGUpdate) -> None:
             portfolio=state.portfolio,
             portfolio_path=state.args.portfolio_path,
             book_cache=state.book_cache,
+            depth_map=depth_map,
             verbose=False,
         )
         if counts and counts.get("placed", 0) > 0:
@@ -235,6 +259,7 @@ async def on_wug_update(state: DaemonState, upd: WUGUpdate) -> None:
             portfolio=state.portfolio,
             portfolio_path=state.args.portfolio_path,
             yesterday_actuals=state.yesterday_actuals,
+            depth_map=depth_map,
             verbose=False,
         )
         if counts and counts.get("placed", 0) > 0:
@@ -255,6 +280,7 @@ async def on_wug_update(state: DaemonState, upd: WUGUpdate) -> None:
             client=state.client,
             portfolio=state.portfolio,
             portfolio_path=state.args.portfolio_path,
+            depth_map=depth_map,
             verbose=False,
         )
         if counts and counts.get("placed", 0) > 0:

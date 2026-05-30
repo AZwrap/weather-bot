@@ -145,6 +145,7 @@ def detect_and_execute_high_bucket_no(
     log_path: Path = DEFAULT_LOG_PATH,
     verbose: bool = False,
     book_cache: Any = None,
+    depth_map: dict | None = None,
 ) -> dict[str, int]:
     """For (station_id, target_date_iso, target), find buckets that are
     N_BUCKETS_AWAY or more past the current peak/trough and submit FAK
@@ -270,11 +271,30 @@ def detect_and_execute_high_bucket_no(
         # Polymarket only accepts 2-decimal limit prices. We submit at
         # the CAP (max_no_ask = $0.98) and let the matching engine walk
         # the book — fills at the cheapest available ask, never above
-        # our limit. Mirrors guaranteed_no_buy.py's hard_cap_price logic.
-        # The actual current no_ask is logged separately for analysis.
+        # our limit.
         submitted_limit = round(float(max_no_ask), 2)
-        # Integer shares × 2-decimal limit guarantees a clean maker_amount.
-        shares = float(max(1, int(size_usd / submitted_limit)))
+
+        # DEPTH-AWARE FILL. Walk the NO-token ask ladder up to the limit
+        # to get the realistic avg fill + filled shares. Without depth we
+        # used to assume the whole $5 cleared at top-of-book — optimistic
+        # on thin books. If there's no acceptable depth, skip (the order
+        # couldn't fill a minimum-size lot in reality).
+        from .polymarket import simulate_buy_fill
+        depth = (depth_map or {}).get(m.no_token_id)
+        sim = simulate_buy_fill(depth, size_usd, submitted_limit)
+        if sim is None:
+            if depth_map is not None:
+                counts["skipped_no_depth"] += 1
+                continue
+            # No depth_map supplied (e.g. unit test) → fall back to the
+            # old top-of-book assumption, flagged in the log.
+            fill_avg = no_ask
+            shares = float(max(1, int(size_usd / submitted_limit)))
+            fully_filled = True
+            depth_source = "top_of_book_fallback"
+        else:
+            fill_avg, shares, fully_filled = sim
+            depth_source = "depth_walk"
 
         signal = TradeSignal(
             station=station, event_title="", event_slug="",
@@ -284,13 +304,13 @@ def detect_and_execute_high_bucket_no(
             our_prob=1.0 - no_ask, yes_implied=float(m.yes_ask or 0.0),
             yes_bid=m.yes_bid, yes_ask=m.yes_ask,
             side="NO", edge=1.0 - no_ask,
-            # fill_price is the EXPECTED fill (= current top-of-book ask).
-            # The signal's fill_price drives share-sizing inside
-            # ExecutionClient.submit_order; we override with shares.
-            fill_price=no_ask,
+            # fill_price = depth-walked avg (what a real FAK gets). The
+            # dry-run client records this as the fill; override_shares is
+            # the depth-limited filled size.
+            fill_price=fill_avg,
             volume_24hr=0.0, bias_applied_c=0.0,
             sigma_ensemble_c=0.0, sigma_total_c=0.0,
-            kelly_full=1.0, position_usd=size_usd,
+            kelly_full=1.0, position_usd=fill_avg * shares,
         )
         try:
             result = client.submit_order(
@@ -317,14 +337,14 @@ def detect_and_execute_high_bucket_no(
             }, log_path)
             continue
 
-        # Persist position
+        # Persist position — entry_price = depth-walked avg fill.
         position = Position(
             token_id=m.no_token_id, side="NO",
             station_id=station_id, region=region_for(station_id),
             market_id=int(m.market_id), bucket_label=m.bucket_label,
             bucket_kind=kind, bucket_threshold=int(thr),
             target_date=target_date_iso,
-            shares=shares, entry_price=no_ask, position_usd=size_usd,
+            shares=shares, entry_price=fill_avg, position_usd=fill_avg * shares,
             submitted_at=_now_utc_iso(), status="filled",
             order_id=result.order_id, strategy="high_bucket_no",
         )
@@ -345,11 +365,13 @@ def detect_and_execute_high_bucket_no(
             "observed_extreme_c": observed_extreme_c,
             "peak_low_c": peak_low_c, "peak_high_c": peak_high_c,
             "bucket_low_c": low_c, "bucket_high_c": high_c,
-            "no_ask_snapshot": no_ask,        # current book ask at fire time (may be 3 decimals)
+            "no_ask_snapshot": no_ask,        # top-of-book ask at fire time
             "no_ask_source": no_ask_source,
-            "submitted_limit": submitted_limit,  # 2-decimal limit we actually submitted
-            "fill_price": result.fill_price,     # actual fill from matching engine
-            "shares": shares, "size_usd": size_usd,
+            "submitted_limit": submitted_limit,
+            "fill_price": result.fill_price,     # depth-walked avg fill
+            "depth_source": depth_source,        # "depth_walk" | "top_of_book_fallback"
+            "fully_filled": fully_filled,        # False = depth ran out, partial fill
+            "shares": shares, "size_usd": fill_avg * shares,
             "order_id": result.order_id, "local_hour": local_h,
         }, log_path)
 

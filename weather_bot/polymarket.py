@@ -482,6 +482,63 @@ def _walk_levels(
     return (avg_price, total_shares, fully_filled)
 
 
+def simulate_buy_fill(
+    depth: "OrderBookDepth | None",
+    size_usd: float,
+    limit_price: float,
+    min_order_size: float | None = None,
+) -> tuple[float, float, bool] | None:
+    """Simulate a marketable BUY (FAK) against the ask ladder.
+
+    Walks the asks at price ≤ limit_price, cheapest first, consuming up
+    to size_usd. Returns (avg_fill_price, filled_shares, fully_filled),
+    or None if there isn't enough depth at acceptable prices to clear
+    the exchange minimum order size.
+
+    This is what makes paper fills HONEST: instead of assuming the whole
+    order clears at top-of-book, it reflects the depth-walked average a
+    real FAK would get (and flags partial fills via fully_filled=False).
+    """
+    if depth is None or not depth.asks:
+        return None
+    mos = min_order_size if min_order_size is not None else float(depth.min_order_size)
+    asks_under_limit = [lv for lv in depth.asks if lv.price <= float(limit_price) + 1e-9]
+    return _walk_levels(asks_under_limit, float(size_usd), mos)
+
+
+def simulate_sell_fill(
+    depth: "OrderBookDepth | None",
+    shares: float,
+    min_price: float = 0.0,
+    min_order_size: float | None = None,
+) -> tuple[float, float, bool] | None:
+    """Simulate a marketable SELL (FAK) against the bid ladder.
+
+    Walks the bids at price ≥ min_price, highest first, selling up to
+    `shares`. Returns (avg_fill_price, sold_shares, fully_sold) or None
+    if no acceptable bid depth. Used for depth-aware exit P&L.
+    """
+    if depth is None or not depth.bids:
+        return None
+    remaining = float(shares)
+    total_proceeds = 0.0
+    total_sold = 0.0
+    for lv in depth.bids:  # bids sorted desc (best first)
+        if lv.price < float(min_price) - 1e-9 or lv.price <= 0 or lv.size_shares <= 0:
+            continue
+        take = min(remaining, lv.size_shares)
+        total_sold += take
+        total_proceeds += take * lv.price
+        remaining -= take
+        if remaining <= 1e-9:
+            break
+    if total_sold <= 0:
+        return None
+    avg = total_proceeds / total_sold
+    fully = remaining <= 1e-6
+    return (avg, total_sold, fully)
+
+
 async def fetch_orderbook_depth(
     token_id: str,
     client: httpx.AsyncClient | None = None,

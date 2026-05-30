@@ -123,6 +123,7 @@ def detect_and_execute_consensus_yes(
     max_yes_ask: float = MAX_YES_ASK,
     size_usd: float = DEFAULT_SIZE_USD,
     log_path: Path = DEFAULT_LOG_PATH,
+    depth_map: dict | None = None,
     verbose: bool = False,
 ) -> dict[str, int]:
     """Fire YES on the leading mid bucket if yes_ask is in band.
@@ -187,7 +188,25 @@ def detect_and_execute_consensus_yes(
     submitted_limit = math.ceil(leader_ya * 100) / 100.0
     # Clamp to max_yes_ask just in case rounding pushes above the cap.
     submitted_limit = min(submitted_limit, round(max_yes_ask, 2))
-    shares = float(max(1, int(size_usd / submitted_limit)))
+
+    # DEPTH-AWARE FILL — walk the YES ask ladder up to the limit. This is
+    # the strategy where it matters most: buying YES at the ask on a wide
+    # book, a real FAK walks UP, so the depth-walked avg is worse than the
+    # top tick — exactly the cost that makes consensus_yes a spread-bleed.
+    from .polymarket import simulate_buy_fill
+    depth = (depth_map or {}).get(leader_m.yes_token_id)
+    sim = simulate_buy_fill(depth, size_usd, submitted_limit)
+    if sim is None:
+        if depth_map is not None:
+            counts["skipped_no_depth"] += 1
+            return dict(counts)
+        fill_avg = leader_ya
+        shares = float(max(1, int(size_usd / submitted_limit)))
+        fully_filled = True
+        depth_source = "top_of_book_fallback"
+    else:
+        fill_avg, shares, fully_filled = sim
+        depth_source = "depth_walk"
 
     signal = TradeSignal(
         station=station, event_title="", event_slug="",
@@ -198,9 +217,9 @@ def detect_and_execute_consensus_yes(
         our_prob=leader_ya, yes_implied=leader_ya,
         yes_bid=leader_m.yes_bid, yes_ask=leader_m.yes_ask,
         side="YES", edge=0.0,
-        fill_price=leader_ya, volume_24hr=0.0,
+        fill_price=fill_avg, volume_24hr=0.0,
         bias_applied_c=0.0, sigma_ensemble_c=0.0, sigma_total_c=0.0,
-        kelly_full=1.0, position_usd=size_usd,
+        kelly_full=1.0, position_usd=fill_avg * shares,
     )
     try:
         result = client.submit_order(
@@ -236,7 +255,7 @@ def detect_and_execute_consensus_yes(
         bucket_label=leader_m.bucket_label, bucket_kind=leader_kind,
         bucket_threshold=leader_thr,
         target_date=target_date_iso,
-        shares=shares, entry_price=leader_ya, position_usd=size_usd,
+        shares=shares, entry_price=fill_avg, position_usd=fill_avg * shares,
         submitted_at=_now_utc_iso(), status="filled",
         order_id=result.order_id, strategy="consensus_yes",
     )
@@ -254,8 +273,10 @@ def detect_and_execute_consensus_yes(
         "bucket_kind": leader_kind, "bucket_threshold": leader_thr,
         "yes_ask_snapshot": leader_ya,
         "submitted_limit": submitted_limit,
-        "fill_price": result.fill_price,
-        "shares": shares, "size_usd": size_usd,
+        "fill_price": result.fill_price,        # depth-walked avg fill
+        "depth_source": depth_source,
+        "fully_filled": fully_filled,
+        "shares": shares, "size_usd": fill_avg * shares,
         "order_id": result.order_id,
         "n_mids_in_event": len(mids),
         # Rank-2 yes_ask to gauge gap to second-place (signal-strength proxy)
