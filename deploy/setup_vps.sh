@@ -114,12 +114,18 @@ if [[ -f "$DASH_SRC" ]]; then
 fi
 
 # ── 7c. Forecast-logger timer (calibration shadow data) ───────────────
-# Bootstrap an empty bias table so log_forecasts runs zero-bias until
-# train_bias.py builds the real one at N≥30 resolved days (breaks the
-# chicken-and-egg: the table is trained FROM accumulated forecast data).
+# Seed the bias table. Prefer the committed WUG-truth seed (built from
+# the archived production forecasts re-resolved against Wunderground —
+# the oracle source); fall back to an empty zero-bias table. The weekly
+# bias-retrain merges fresh WUG data over this seed as N grows.
 if [[ ! -f "$PROJECT_DIR/bias_table.json" ]]; then
-  echo "[]" > "$PROJECT_DIR/bias_table.json"
-  echo "==> Bootstrapped empty bias_table.json (zero-bias forecast logging)."
+  if [[ -f "$PROJECT_DIR/deploy/bias_table_seed.json" ]]; then
+    cp "$PROJECT_DIR/deploy/bias_table_seed.json" "$PROJECT_DIR/bias_table.json"
+    echo "==> Seeded bias_table.json from deploy/bias_table_seed.json (WUG-truth)."
+  else
+    echo "[]" > "$PROJECT_DIR/bias_table.json"
+    echo "==> Bootstrapped empty bias_table.json (zero-bias forecast logging)."
+  fi
 fi
 
 FC_SVC_SRC="$PROJECT_DIR/deploy/forecast-logger.service"

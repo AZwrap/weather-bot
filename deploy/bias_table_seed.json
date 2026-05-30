@@ -1,0 +1,442 @@
+[
+  {
+    "station_id": "CYYZ",
+    "target": "max",
+    "bias_c": 0.2688,
+    "n_days": 16,
+    "rmse_c": 1.1618,
+    "trained_through": "2026-05-24"
+  },
+  {
+    "station_id": "DNMM",
+    "target": "max",
+    "bias_c": -2.3489,
+    "n_days": 15,
+    "rmse_c": 3.2201,
+    "trained_through": "2026-05-24"
+  },
+  {
+    "station_id": "EDDM",
+    "target": "max",
+    "bias_c": -1.2733,
+    "n_days": 15,
+    "rmse_c": 1.5666,
+    "trained_through": "2026-05-24"
+  },
+  {
+    "station_id": "EFHK",
+    "target": "max",
+    "bias_c": -1.7422,
+    "n_days": 15,
+    "rmse_c": 2.1001,
+    "trained_through": "2026-05-24"
+  },
+  {
+    "station_id": "EGLC",
+    "target": "max",
+    "bias_c": -0.0556,
+    "n_days": 15,
+    "rmse_c": 0.9686,
+    "trained_through": "2026-05-24"
+  },
+  {
+    "station_id": "EGLC",
+    "target": "min",
+    "bias_c": -0.317,
+    "n_days": 15,
+    "rmse_c": 0.7782,
+    "trained_through": "2026-05-24"
+  },
+  {
+    "station_id": "EHAM",
+    "target": "max",
+    "bias_c": -0.8919,
+    "n_days": 15,
+    "rmse_c": 1.141,
+    "trained_through": "2026-05-24"
+  },
+  {
+    "station_id": "EPWA",
+    "target": "max",
+    "bias_c": -0.5015,
+    "n_days": 15,
+    "rmse_c": 1.4014,
+    "trained_through": "2026-05-24"
+  },
+  {
+    "station_id": "FACT",
+    "target": "max",
+    "bias_c": -0.8852,
+    "n_days": 15,
+    "rmse_c": 1.446,
+    "trained_through": "2026-05-24"
+  },
+  {
+    "station_id": "KATL",
+    "target": "max",
+    "bias_c": -0.9044,
+    "n_days": 15,
+    "rmse_c": 1.4372,
+    "trained_through": "2026-05-23"
+  },
+  {
+    "station_id": "KAUS",
+    "target": "max",
+    "bias_c": -0.6188,
+    "n_days": 16,
+    "rmse_c": 0.927,
+    "trained_through": "2026-05-24"
+  },
+  {
+    "station_id": "KBKF",
+    "target": "max",
+    "bias_c": -1.5486,
+    "n_days": 16,
+    "rmse_c": 1.9114,
+    "trained_through": "2026-05-24"
+  },
+  {
+    "station_id": "KDAL",
+    "target": "max",
+    "bias_c": -0.8948,
+    "n_days": 15,
+    "rmse_c": 1.6687,
+    "trained_through": "2026-05-23"
+  },
+  {
+    "station_id": "KHOU",
+    "target": "max",
+    "bias_c": -1.0681,
+    "n_days": 16,
+    "rmse_c": 1.4323,
+    "trained_through": "2026-05-24"
+  },
+  {
+    "station_id": "KLAX",
+    "target": "max",
+    "bias_c": 4.3405,
+    "n_days": 17,
+    "rmse_c": 4.7698,
+    "trained_through": "2026-05-25"
+  },
+  {
+    "station_id": "KLGA",
+    "target": "max",
+    "bias_c": -0.2562,
+    "n_days": 16,
+    "rmse_c": 1.2462,
+    "trained_through": "2026-05-24"
+  },
+  {
+    "station_id": "KLGA",
+    "target": "min",
+    "bias_c": -0.3854,
+    "n_days": 16,
+    "rmse_c": 0.9247,
+    "trained_through": "2026-05-24"
+  },
+  {
+    "station_id": "KMIA",
+    "target": "max",
+    "bias_c": -1.691,
+    "n_days": 16,
+    "rmse_c": 1.7819,
+    "trained_through": "2026-05-24"
+  },
+  {
+    "station_id": "KMIA",
+    "target": "min",
+    "bias_c": 0.4285,
+    "n_days": 16,
+    "rmse_c": 0.9301,
+    "trained_through": "2026-05-24"
+  },
+  {
+    "station_id": "KORD",
+    "target": "max",
+    "bias_c": 0.2271,
+    "n_days": 16,
+    "rmse_c": 1.1309,
+    "trained_through": "2026-05-24"
+  },
+  {
+    "station_id": "KSEA",
+    "target": "max",
+    "bias_c": -0.6039,
+    "n_days": 17,
+    "rmse_c": 1.5583,
+    "trained_through": "2026-05-25"
+  },
+  {
+    "station_id": "KSFO",
+    "target": "max",
+    "bias_c": 1.4299,
+    "n_days": 16,
+    "rmse_c": 2.2045,
+    "trained_through": "2026-05-25"
+  },
+  {
+    "station_id": "LEMD",
+    "target": "max",
+    "bias_c": -0.7474,
+    "n_days": 15,
+    "rmse_c": 1.0452,
+    "trained_through": "2026-05-24"
+  },
+  {
+    "station_id": "LFPB",
+    "target": "max",
+    "bias_c": -1.2635,
+    "n_days": 14,
+    "rmse_c": 1.4631,
+    "trained_through": "2026-05-24"
+  },
+  {
+    "station_id": "LFPB",
+    "target": "min",
+    "bias_c": 0.4941,
+    "n_days": 15,
+    "rmse_c": 0.811,
+    "trained_through": "2026-05-24"
+  },
+  {
+    "station_id": "LIMC",
+    "target": "max",
+    "bias_c": -1.5474,
+    "n_days": 15,
+    "rmse_c": 1.9939,
+    "trained_through": "2026-05-24"
+  },
+  {
+    "station_id": "LLBG",
+    "target": "max",
+    "bias_c": 1.2675,
+    "n_days": 14,
+    "rmse_c": 1.5698,
+    "trained_through": "2026-05-24"
+  },
+  {
+    "station_id": "LTAC",
+    "target": "max",
+    "bias_c": -2.1207,
+    "n_days": 15,
+    "rmse_c": 2.5098,
+    "trained_through": "2026-05-24"
+  },
+  {
+    "station_id": "LTFM",
+    "target": "max",
+    "bias_c": -1.6615,
+    "n_days": 15,
+    "rmse_c": 2.2859,
+    "trained_through": "2026-05-24"
+  },
+  {
+    "station_id": "MMMX",
+    "target": "max",
+    "bias_c": -0.2333,
+    "n_days": 16,
+    "rmse_c": 1.0782,
+    "trained_through": "2026-05-24"
+  },
+  {
+    "station_id": "MPMG",
+    "target": "max",
+    "bias_c": -1.1304,
+    "n_days": 15,
+    "rmse_c": 1.4654,
+    "trained_through": "2026-05-24"
+  },
+  {
+    "station_id": "NZWN",
+    "target": "max",
+    "bias_c": -0.9843,
+    "n_days": 12,
+    "rmse_c": 1.2159,
+    "trained_through": "2026-05-24"
+  },
+  {
+    "station_id": "OEJN",
+    "target": "max",
+    "bias_c": 2.5156,
+    "n_days": 15,
+    "rmse_c": 3.0013,
+    "trained_through": "2026-05-24"
+  },
+  {
+    "station_id": "RCSS",
+    "target": "max",
+    "bias_c": -1.4179,
+    "n_days": 13,
+    "rmse_c": 1.9429,
+    "trained_through": "2026-05-24"
+  },
+  {
+    "station_id": "RJTT",
+    "target": "max",
+    "bias_c": 1.2231,
+    "n_days": 13,
+    "rmse_c": 1.8311,
+    "trained_through": "2026-05-24"
+  },
+  {
+    "station_id": "RJTT",
+    "target": "min",
+    "bias_c": -0.794,
+    "n_days": 13,
+    "rmse_c": 1.2843,
+    "trained_through": "2026-05-24"
+  },
+  {
+    "station_id": "RKPK",
+    "target": "max",
+    "bias_c": 0.8872,
+    "n_days": 13,
+    "rmse_c": 1.7394,
+    "trained_through": "2026-05-24"
+  },
+  {
+    "station_id": "RKSI",
+    "target": "max",
+    "bias_c": -1.7974,
+    "n_days": 13,
+    "rmse_c": 2.1743,
+    "trained_through": "2026-05-24"
+  },
+  {
+    "station_id": "RKSI",
+    "target": "min",
+    "bias_c": -0.3427,
+    "n_days": 13,
+    "rmse_c": 0.7444,
+    "trained_through": "2026-05-24"
+  },
+  {
+    "station_id": "RPLL",
+    "target": "max",
+    "bias_c": -2.1051,
+    "n_days": 13,
+    "rmse_c": 2.2596,
+    "trained_through": "2026-05-24"
+  },
+  {
+    "station_id": "SAEZ",
+    "target": "max",
+    "bias_c": -0.9931,
+    "n_days": 16,
+    "rmse_c": 1.1511,
+    "trained_through": "2026-05-24"
+  },
+  {
+    "station_id": "SBGR",
+    "target": "max",
+    "bias_c": 0.0986,
+    "n_days": 16,
+    "rmse_c": 1.1399,
+    "trained_through": "2026-05-24"
+  },
+  {
+    "station_id": "UUWW",
+    "target": "max",
+    "bias_c": -0.3548,
+    "n_days": 15,
+    "rmse_c": 1.8603,
+    "trained_through": "2026-05-24"
+  },
+  {
+    "station_id": "VILK",
+    "target": "max",
+    "bias_c": -0.1698,
+    "n_days": 14,
+    "rmse_c": 0.6016,
+    "trained_through": "2026-05-24"
+  },
+  {
+    "station_id": "WMKK",
+    "target": "max",
+    "bias_c": -1.9171,
+    "n_days": 13,
+    "rmse_c": 2.13,
+    "trained_through": "2026-05-24"
+  },
+  {
+    "station_id": "WSSS",
+    "target": "max",
+    "bias_c": -1.4598,
+    "n_days": 13,
+    "rmse_c": 1.6756,
+    "trained_through": "2026-05-24"
+  },
+  {
+    "station_id": "ZBAA",
+    "target": "max",
+    "bias_c": 0.4803,
+    "n_days": 13,
+    "rmse_c": 2.8522,
+    "trained_through": "2026-05-24"
+  },
+  {
+    "station_id": "ZGGG",
+    "target": "max",
+    "bias_c": -0.8034,
+    "n_days": 13,
+    "rmse_c": 1.8285,
+    "trained_through": "2026-05-24"
+  },
+  {
+    "station_id": "ZGSZ",
+    "target": "max",
+    "bias_c": -0.688,
+    "n_days": 13,
+    "rmse_c": 1.0144,
+    "trained_through": "2026-05-24"
+  },
+  {
+    "station_id": "ZHHH",
+    "target": "max",
+    "bias_c": -0.2487,
+    "n_days": 13,
+    "rmse_c": 1.349,
+    "trained_through": "2026-05-24"
+  },
+  {
+    "station_id": "ZSPD",
+    "target": "max",
+    "bias_c": -1.0624,
+    "n_days": 13,
+    "rmse_c": 1.5923,
+    "trained_through": "2026-05-24"
+  },
+  {
+    "station_id": "ZSPD",
+    "target": "min",
+    "bias_c": -0.0179,
+    "n_days": 13,
+    "rmse_c": 0.4615,
+    "trained_through": "2026-05-24"
+  },
+  {
+    "station_id": "ZSQD",
+    "target": "max",
+    "bias_c": 0.6325,
+    "n_days": 13,
+    "rmse_c": 1.9679,
+    "trained_through": "2026-05-24"
+  },
+  {
+    "station_id": "ZUCK",
+    "target": "max",
+    "bias_c": -1.2983,
+    "n_days": 13,
+    "rmse_c": 2.1226,
+    "trained_through": "2026-05-24"
+  },
+  {
+    "station_id": "ZUUU",
+    "target": "max",
+    "bias_c": 0.1009,
+    "n_days": 13,
+    "rmse_c": 1.9198,
+    "trained_through": "2026-05-24"
+  }
+]
