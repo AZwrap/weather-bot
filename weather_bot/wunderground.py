@@ -52,7 +52,17 @@ import httpx
 # rotates this we fail-soft and the calling code falls back to METAR.
 DEFAULT_API_KEY = "e1f10a1e78da46f5b10a1e78da96f525"
 
-ENDPOINT_TEMPLATE = (
+# Geocode-based endpoint (lat/lon) — country-AGNOSTIC. The old
+# /location/{icao}:9:US/ form hardcoded country=US and returned HTTP 400
+# for every non-US station (RKSI, EGLL, RJTT, …), silently breaking WUG
+# resolution + calibration for ~half the universe. Geocode by the
+# station's lat/lon (from locations.py) works for all stations.
+GEOCODE_ENDPOINT = (
+    "https://api.weather.com/v1/geocode/{lat}/{lon}/observations/historical.json"
+)
+# Legacy location endpoint kept only as a last-resort fallback when a
+# station's lat/lon isn't resolvable.
+LEGACY_ENDPOINT = (
     "https://api.weather.com/v1/location/{icao}:9:US/observations/historical.json"
 )
 USER_AGENT = "weather-bot-shadow-harness/0.1 (research)"
@@ -191,7 +201,21 @@ async def fetch_wunderground_daily(
         client = httpx.AsyncClient(timeout=30.0)
 
     ymd_compact = target_date.strftime("%Y%m%d")
-    url = ENDPOINT_TEMPLATE.format(icao=icao.upper())
+    # Resolve the station's lat/lon for the geocode endpoint (works for
+    # all countries). Fall back to the legacy US-location form only if
+    # the station isn't in the registry.
+    lat = lon = None
+    try:
+        from .locations import STATIONS_BY_ID
+        st = STATIONS_BY_ID.get(icao.upper())
+        if st is not None:
+            lat, lon = st.latitude, st.longitude
+    except Exception:
+        pass
+    if lat is not None and lon is not None:
+        url = GEOCODE_ENDPOINT.format(lat=lat, lon=lon)
+    else:
+        url = LEGACY_ENDPOINT.format(icao=icao.upper())
     params = {
         "apiKey": api_key,
         # Request Fahrenheit (the native ASOS / Wunderground unit) and
