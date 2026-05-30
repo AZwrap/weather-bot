@@ -113,6 +113,31 @@ if [[ -f "$DASH_SRC" ]]; then
   echo "    Reach via SSH tunnel: ssh -L 8501:localhost:8501 <vps-alias>"
 fi
 
+# ── 7c. Forecast-logger timer (calibration shadow data) ───────────────
+# Bootstrap an empty bias table so log_forecasts runs zero-bias until
+# train_bias.py builds the real one at N≥30 resolved days (breaks the
+# chicken-and-egg: the table is trained FROM accumulated forecast data).
+if [[ ! -f "$PROJECT_DIR/bias_table.json" ]]; then
+  echo "[]" > "$PROJECT_DIR/bias_table.json"
+  echo "==> Bootstrapped empty bias_table.json (zero-bias forecast logging)."
+fi
+
+FC_SVC_SRC="$PROJECT_DIR/deploy/forecast-logger.service"
+FC_TMR_SRC="$PROJECT_DIR/deploy/forecast-logger.timer"
+if [[ -f "$FC_SVC_SRC" && -f "$FC_TMR_SRC" ]]; then
+  echo "==> Installing forecast-logger.service + .timer…"
+  sudo cp "$FC_SVC_SRC" /etc/systemd/system/forecast-logger.service
+  sudo cp "$FC_TMR_SRC" /etc/systemd/system/forecast-logger.timer
+  sudo sed -i \
+    -e "s|/USER|$RUN_USER|g" \
+    -e "s|/PROJECT_PATH/Weather_Bot|$PROJECT_DIR|g" \
+    /etc/systemd/system/forecast-logger.service
+  sudo systemctl daemon-reload
+  sudo systemctl enable --now forecast-logger.timer
+  echo "==> Forecast-logger timer enabled (daily 12:00 UTC). Shadow only,"
+  echo "    writes data/forecast_log.jsonl; the bot does NOT trade on forecasts."
+fi
+
 # ── 8. Verification cheatsheet ────────────────────────────────────────
 cat <<EOF
 

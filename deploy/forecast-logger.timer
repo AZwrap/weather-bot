@@ -1,0 +1,13 @@
+[Unit]
+Description=Daily trigger for the Weather Bot forecast logger
+
+[Timer]
+# Once per day at 12:00 UTC. The script logs forecasts for today +
+# tomorrow events, so a fixed daily run gives a consistent ~1-day lead
+# for calibration. Persistent=true catches up a missed run if the VPS
+# was down at 12:00.
+OnCalendar=*-*-* 12:00:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

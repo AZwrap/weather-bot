@@ -1,0 +1,28 @@
+[Unit]
+Description=Weather Bot — daily forecast logger (calibration shadow data)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Substitute /USER and /PROJECT_PATH/Weather_Bot at install time.
+Type=oneshot
+User=/USER
+WorkingDirectory=/PROJECT_PATH/Weather_Bot
+Environment=PYTHONUNBUFFERED=1
+
+# Logs ENSEMBLE forecasts (51 ECMWF members + multimodel) → per-bucket
+# probabilities for each (station, target, date), into its OWN file
+# data/forecast_log.jsonl. This is SHADOW data for a future calibration
+# decision — the bot does NOT trade on forecasts (no_forecast_logic
+# rule). bias_applied=0 until train_bias.py builds the table at N≥30
+# resolved days. --no-capture-depth keeps it lean (no /book load).
+ExecStart=/PROJECT_PATH/Weather_Bot/.venv/bin/python \
+    /PROJECT_PATH/Weather_Bot/log_forecasts.py \
+    --no-skip-forecasts \
+    --no-capture-depth \
+    --log /PROJECT_PATH/Weather_Bot/data/forecast_log.jsonl
+
+# A forecast-fetch failure must NEVER affect trading — this unit is
+# fully independent of slim-daemon. Bounded runtime.
+TimeoutStartSec=600
+Nice=10
