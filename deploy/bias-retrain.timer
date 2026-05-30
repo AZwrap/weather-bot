@@ -1,0 +1,13 @@
+[Unit]
+Description=Weekly trigger for the Weather Bot bias-table re-train
+
+[Timer]
+# Weekly, Monday 11:30 UTC (30 min before the daily forecast logger at
+# 12:00, so each day's forecasts use the freshest weekly bias). The
+# merge guard means early weeks keep the archived seed until each
+# station has >=14 fresh resolved days.
+OnCalendar=Mon *-*-* 11:30:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

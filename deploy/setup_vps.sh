@@ -138,6 +138,23 @@ if [[ -f "$FC_SVC_SRC" && -f "$FC_TMR_SRC" ]]; then
   echo "    writes data/forecast_log.jsonl; the bot does NOT trade on forecasts."
 fi
 
+# ── 7d. Bias-table weekly re-train timer ──────────────────────────────
+BR_SVC_SRC="$PROJECT_DIR/deploy/bias-retrain.service"
+BR_TMR_SRC="$PROJECT_DIR/deploy/bias-retrain.timer"
+if [[ -f "$BR_SVC_SRC" && -f "$BR_TMR_SRC" ]]; then
+  echo "==> Installing bias-retrain.service + .timer…"
+  sudo cp "$BR_SVC_SRC" /etc/systemd/system/bias-retrain.service
+  sudo cp "$BR_TMR_SRC" /etc/systemd/system/bias-retrain.timer
+  sudo sed -i \
+    -e "s|/USER|$RUN_USER|g" \
+    -e "s|/PROJECT_PATH/Weather_Bot|$PROJECT_DIR|g" \
+    /etc/systemd/system/bias-retrain.service
+  sudo systemctl daemon-reload
+  sudo systemctl enable --now bias-retrain.timer
+  echo "==> Bias-retrain timer enabled (weekly Mon 11:30 UTC). Merges fresh"
+  echo "    over the seed; replaces a station only at >=14 fresh resolved days."
+fi
+
 # ── 8. Verification cheatsheet ────────────────────────────────────────
 cat <<EOF
 

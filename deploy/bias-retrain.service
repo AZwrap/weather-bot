@@ -1,0 +1,28 @@
+[Unit]
+Description=Weather Bot — weekly bias-table re-train (merge fresh over seed)
+After=network-online.target
+
+[Service]
+# Substitute /USER and /PROJECT_PATH/Weather_Bot at install time.
+Type=oneshot
+User=/USER
+WorkingDirectory=/PROJECT_PATH/Weather_Bot
+Environment=PYTHONUNBUFFERED=1
+
+# Re-train per-station bias from the FRESH lite-rebuild logs:
+#   forecasts: data/forecast_log.jsonl (raw_members_c)
+#   actuals:   data/forward_log.jsonl  (resolver actual_obs_c)
+# MERGE over the existing table — a fresh entry only replaces the
+# archived seed once that station has >=14 fresh resolved days, so a
+# thin re-train can't wipe the seed. Once fresh data matures, the
+# better-lead production bias takes over per-station.
+ExecStart=/PROJECT_PATH/Weather_Bot/.venv/bin/python \
+    /PROJECT_PATH/Weather_Bot/build_bias_from_logs.py \
+    --forecasts /PROJECT_PATH/Weather_Bot/data/forecast_log.jsonl \
+    --actuals /PROJECT_PATH/Weather_Bot/data/forward_log.jsonl \
+    --merge-into /PROJECT_PATH/Weather_Bot/bias_table.json \
+    --replace-min-days 14 \
+    --output /PROJECT_PATH/Weather_Bot/bias_table.json
+
+TimeoutStartSec=300
+Nice=10
