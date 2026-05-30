@@ -692,13 +692,17 @@ def detect_and_execute_guaranteed_buys(
             from weather_bot.polymarket import simulate_buy_fill
             _depth = depth_map.get(market.no_token_id)
             _sim = simulate_buy_fill(_depth, effective_size_usd, limit_price_clean)
-            if _sim is None:
+            if _sim is not None:
+                _fill_avg, _walked_shares, fully_filled = _sim
+                signal.fill_price = _fill_avg   # propagates into dry-run OrderResult
+                depth_source = "depth_walk"
+            elif _depth is not None:
+                # real book but insufficient depth under the cap → gate
                 counts["skipped_no_depth"] += 1
                 release_cap_token(effective_size_usd, station_id=station_id)
                 continue
-            _fill_avg, _walked_shares, fully_filled = _sim
-            signal.fill_price = _fill_avg     # propagates into dry-run OrderResult
-            depth_source = "depth_walk"
+            # else: depth unavailable (404 dead-market) → keep top-of-book
+            # no_ask as the recorded fill (depth_source stays "top_of_book")
         # Sanity-check: verify maker_amount is clean
         maker_amount_check = round(size_shares * limit_price_clean, 4)
         if abs(maker_amount_check - round(maker_amount_check, 2)) > 1e-6:

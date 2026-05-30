@@ -196,17 +196,18 @@ def detect_and_execute_consensus_yes(
     from .polymarket import simulate_buy_fill
     depth = (depth_map or {}).get(leader_m.yes_token_id)
     sim = simulate_buy_fill(depth, size_usd, submitted_limit)
-    if sim is None:
-        if depth_map is not None:
-            counts["skipped_no_depth"] += 1
-            return dict(counts)
+    if sim is not None:
+        fill_avg, shares, fully_filled = sim
+        depth_source = "depth_walk"
+    elif depth is not None:
+        counts["skipped_no_depth"] += 1
+        return dict(counts)
+    else:
+        # depth unavailable (404 dead-market / flaky) → top-of-book fallback
         fill_avg = leader_ya
         shares = float(max(1, int(size_usd / submitted_limit)))
         fully_filled = True
         depth_source = "top_of_book_fallback"
-    else:
-        fill_avg, shares, fully_filled = sim
-        depth_source = "depth_walk"
 
     signal = TradeSignal(
         station=station, event_title="", event_slug="",

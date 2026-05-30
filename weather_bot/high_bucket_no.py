@@ -282,19 +282,22 @@ def detect_and_execute_high_bucket_no(
         from .polymarket import simulate_buy_fill
         depth = (depth_map or {}).get(m.no_token_id)
         sim = simulate_buy_fill(depth, size_usd, submitted_limit)
-        if sim is None:
-            if depth_map is not None:
-                counts["skipped_no_depth"] += 1
-                continue
-            # No depth_map supplied (e.g. unit test) → fall back to the
-            # old top-of-book assumption, flagged in the log.
+        if sim is not None:
+            fill_avg, shares, fully_filled = sim
+            depth_source = "depth_walk"
+        elif depth is not None:
+            # Real book fetched but < min order size under the limit —
+            # a real order couldn't fill. Gate.
+            counts["skipped_no_depth"] += 1
+            continue
+        else:
+            # Depth unavailable (not fetched / 404 dead-market) → fall
+            # back to top-of-book so we don't freeze firing on a flaky or
+            # absent /book. Flagged in the log as optimistic.
             fill_avg = no_ask
             shares = float(max(1, int(size_usd / submitted_limit)))
             fully_filled = True
             depth_source = "top_of_book_fallback"
-        else:
-            fill_avg, shares, fully_filled = sim
-            depth_source = "depth_walk"
 
         signal = TradeSignal(
             station=station, event_title="", event_slug="",

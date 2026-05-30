@@ -552,6 +552,14 @@ async def fetch_orderbook_depth(
             r = await client.get(f"{CLOB_BASE}/book", params={"token_id": token_id})
             r.raise_for_status()
             data = r.json()
+        except httpx.HTTPStatusError as exc:
+            # 404 = no orderbook for this token (closed/archived/resolved
+            # market). Expected noise from the events feed's stale markets —
+            # stay quiet. Caller treats None as "depth unavailable" and
+            # falls back to top-of-book.
+            if exc.response.status_code != 404:
+                print(f"!! fetch_orderbook_depth({token_id[:16]}…): {exc}")
+            return None
         except Exception as exc:
             print(f"!! fetch_orderbook_depth({token_id[:16]}…): {exc}")
             return None
