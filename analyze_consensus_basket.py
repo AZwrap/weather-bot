@@ -69,7 +69,7 @@ def load_jsonl(p: Path) -> list[dict]:
 def _rounded_obs(actual_c: float, unit: str) -> int:
     if unit == "F":
         return int(math.floor(actual_c * 9.0 / 5.0 + 32.0 + 0.1))
-    return int(math.floor(actual_c + 0.05))
+    return int(math.floor(actual_c + 0.5))  # round-half-up: oracle uses rounded °C
 
 
 def _bucket_won(kind: str, threshold: int, actual_int: int, unit: str) -> bool:

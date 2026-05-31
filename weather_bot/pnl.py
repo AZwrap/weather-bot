@@ -87,8 +87,14 @@ def _rounded_observation(actual_c: float, unit: Unit) -> int:
         # F-side: epsilon in F space handles the C->F->C round-trip artifact.
         actual_f = c_to_f(actual_c)
         return int(math.floor(actual_f + 0.1))
-    # C-side: METAR is integer °C natively, no artifact possible.
-    return int(math.floor(actual_c + 0.05))
+    # C-side: ROUND-HALF-UP, not floor (fixed 2026-05-31). The old floor(+0.05)
+    # assumed METAR integer-°C natively. The lite rebuild resolves via WUG,
+    # which serves °F-sourced °C (91°F -> 32.78°C); Wunderground/Polymarket
+    # resolve on the ROUNDED integer °C (33). Verified against 518 archived
+    # C-side resolutions — every one had integer-°C actuals, i.e. the oracle
+    # uses rounded °C, so 32.78 must map to 33 not 32. Native-integer °C is
+    # unchanged by round-half-up (33.0 -> 33), so no regression there.
+    return int(math.floor(actual_c + 0.5))
 
 
 def bucket_won(kind: str, threshold: int, actual_int: int, unit: Unit) -> bool:
