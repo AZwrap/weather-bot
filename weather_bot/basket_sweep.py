@@ -96,18 +96,15 @@ def _leg_snapshot(*, m, side: str, depth, observed_ask: float | None,
     except (ValueError, TypeError, KeyError):
         return None
     # Walk cheapest-first to $size_usd; 0.99 hard cap (don't cross above it).
+    # If there's no walkable depth (empty book, dead/failed /book, or less
+    # than the 5-share exchange minimum), this leg is NOT tradable right
+    # now → return None so it counts as $0 / no position. We NEVER fabricate
+    # a top-of-book fill: an empty bucket must count 0, not a $5 trade.
     sim = simulate_buy_fill(depth, size_usd, 0.99)
-    if sim is not None:
-        fill_avg, shares, fully = sim
-        depth_source = "depth_walk"
-    elif observed_ask is not None and 0.0 < observed_ask <= 0.99:
-        # No depth (dead/flaky /book) → top-of-book single-fill estimate.
-        fill_avg = float(observed_ask)
-        shares = float(max(1, int(size_usd / max(observed_ask, 0.01))))
-        fully = True
-        depth_source = "top_of_book_fallback"
-    else:
+    if sim is None:
         return None
+    fill_avg, shares, fully = sim
+    depth_source = "depth_walk"
     fee = _taker_fee(shares, fill_avg)
     return {
         "side": side,

@@ -117,20 +117,12 @@ def _place_leg(
     kind, thr = parse_bucket(m)
     sim = simulate_buy_fill(depth, size_usd, limit)
     if sim is None:
-        if depth is not None:
-            return "no_depth"
-        # no depth fetched → fall back to top-of-book single fill
-        top = (float(m.yes_ask) if side == "YES"
-               else (1.0 - float(m.yes_bid)) if m.yes_bid is not None else None)
-        if top is None or not (0.0 < top <= limit):
-            return "no_book"
-        fill_avg = top
-        shares = float(max(1, int(size_usd / max(top, 0.01))))
-        fully = True
-        depth_source = "top_of_book_fallback"
-    else:
-        fill_avg, shares, fully = sim
-        depth_source = "depth_walk"
+        # No walkable depth (empty/dead book, failed /book, or under the
+        # 5-share exchange minimum). Do NOT fabricate a top-of-book fill —
+        # an empty bucket is a no-op ($0), never a $5 trade.
+        return "no_depth" if depth is not None else "no_book"
+    fill_avg, shares, fully = sim
+    depth_source = "depth_walk"
 
     signal = TradeSignal(
         station=station, event_title="", event_slug="",

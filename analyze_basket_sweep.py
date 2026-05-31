@@ -80,6 +80,10 @@ def _bucket_won(kind: str, threshold: int, actual_int: int, unit: str) -> bool:
 def _leg_pnl(leg: dict, actual_int: int, unit: str) -> float | None:
     if not leg:
         return None
+    # Exclude any leg that was a fabricated top-of-book fill (pre-fix
+    # logging). Only real depth-walked fills count toward results.
+    if leg.get("depth_source") == "top_of_book_fallback":
+        return None
     kind = leg.get("bucket_kind")
     thr = leg.get("bucket_threshold")
     shares = float(leg.get("shares", 0))

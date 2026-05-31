@@ -85,6 +85,10 @@ def _bucket_won(kind: str, threshold: int, actual_int: int, unit: str) -> bool:
 def _leg_pnl(leg: dict, actual_int: int, unit: str) -> float | None:
     """Realized P&L for one held-to-resolution leg, net of taker fee.
     Returns None if the bucket can't be scored."""
+    # Exclude fabricated top-of-book fills (pre-fix): only count real
+    # depth-walked fills — an empty book is a no-op, never a $5 trade.
+    if leg.get("depth_source") == "top_of_book_fallback":
+        return None
     kind = leg.get("bucket_kind")
     thr = leg.get("bucket_threshold")
     side = leg.get("side")
