@@ -807,14 +807,14 @@ def _maybe_fire_consensus_yes_exit(state: "DaemonState", msg: dict) -> None:
 
 
 _LEADER_FLIP_LOG = Path("data/leader_flips.jsonl")
-# Only log a leader flip if the OUTGOING leader had reached the basket
-# trigger zone (peaked ≥ this). A flip among sub-trigger buckets (e.g. a
-# 0.30 bucket losing the lead) is the market honestly undecided early in
-# the day — irrelevant to us, since we never fire there. We only care
-# when a bucket that reached our decision zone then lost the lead (the
-# roll signal + the locked-then-moved dodgy signal). Tied to the 0.85
-# basket trigger; move together if the trigger changes.
-FLIP_LOG_MIN_PEAK = 0.85
+# Log a leader flip if the OUTGOING leader peaked ≥ this. Set to 0.70 to
+# match the threshold-SWEEP's 0.70–0.99 band, so the flip dataset is
+# COMPLETE for calibration: we capture every leadership change of a bucket
+# that entered the 0.70–0.99 contention zone (needed to tune the per-station
+# trigger anywhere in that range, not just at 0.85). Below 0.70 is pre-
+# contention flicker (e.g. a 0.30 bucket losing the lead) — pure noise we
+# never act on, so it stays unlogged.
+FLIP_LOG_MIN_PEAK = 0.70
 
 
 def _log_leader_flip(record: dict) -> None:
@@ -892,8 +892,8 @@ def _maybe_fire_basket_on_cross(state: "DaemonState", msg: dict) -> None:
         else:
             prev_label, prev_peak = cur      # leader CHANGED
             state.current_leader[sk] = (leader_label, leader_ya)
-            # Only log if the OUTGOING leader reached the trigger zone — a
-            # sub-0.85 flip is honest early-day indecision, not signal.
+            # Log if the OUTGOING leader entered the 0.70–0.99 contention
+            # band (complete calibration dataset); skip sub-0.70 flicker.
             if prev_peak >= FLIP_LOG_MIN_PEAK:
                 _log_leader_flip({
                     "ts_utc": datetime.now(timezone.utc).isoformat(),
