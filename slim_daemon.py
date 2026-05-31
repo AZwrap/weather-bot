@@ -807,6 +807,14 @@ def _maybe_fire_consensus_yes_exit(state: "DaemonState", msg: dict) -> None:
 
 
 _LEADER_FLIP_LOG = Path("data/leader_flips.jsonl")
+# Only log a leader flip if the OUTGOING leader had reached the basket
+# trigger zone (peaked ≥ this). A flip among sub-trigger buckets (e.g. a
+# 0.30 bucket losing the lead) is the market honestly undecided early in
+# the day — irrelevant to us, since we never fire there. We only care
+# when a bucket that reached our decision zone then lost the lead (the
+# roll signal + the locked-then-moved dodgy signal). Tied to the 0.85
+# basket trigger; move together if the trigger changes.
+FLIP_LOG_MIN_PEAK = 0.85
 
 
 def _log_leader_flip(record: dict) -> None:
@@ -882,15 +890,18 @@ def _maybe_fire_basket_on_cross(state: "DaemonState", msg: dict) -> None:
             if leader_ya > cur[1]:           # same leader — track its peak
                 state.current_leader[sk] = (leader_label, leader_ya)
         else:
-            prev_label, prev_peak = cur      # leader CHANGED → log the flip
+            prev_label, prev_peak = cur      # leader CHANGED
             state.current_leader[sk] = (leader_label, leader_ya)
-            _log_leader_flip({
-                "ts_utc": datetime.now(timezone.utc).isoformat(),
-                "station_id": sk[0], "target": sk[1], "target_date": sk[2],
-                "from_bucket": prev_label, "from_peak_ask": round(prev_peak, 3),
-                "to_bucket": leader_label, "to_leader_ask": round(leader_ya, 3),
-                "runner_up_ask": round(runner_up, 3),
-            })
+            # Only log if the OUTGOING leader reached the trigger zone — a
+            # sub-0.85 flip is honest early-day indecision, not signal.
+            if prev_peak >= FLIP_LOG_MIN_PEAK:
+                _log_leader_flip({
+                    "ts_utc": datetime.now(timezone.utc).isoformat(),
+                    "station_id": sk[0], "target": sk[1], "target_date": sk[2],
+                    "from_bucket": prev_label, "from_peak_ask": round(prev_peak, 3),
+                    "to_bucket": leader_label, "to_leader_ask": round(leader_ya, 3),
+                    "runner_up_ask": round(runner_up, 3),
+                })
 
         hw_now = min(int(leader_ya * 100 + 1e-9), 99)
         if hw_now < 70:

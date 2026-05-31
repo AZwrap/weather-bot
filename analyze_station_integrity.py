@@ -41,12 +41,15 @@ BASKET_LOG = DATA / "consensus_basket_log.jsonl"
 FORWARD_LOG = DATA / "forward_log.jsonl"
 
 # Flag thresholds (review candidates; tune as data accumulates).
-# NOTE: early-day temperature markets legitimately flicker between
-# adjacent buckets before the extreme forms — so a high flip-rate ALONE
-# is weak signal. The high-confidence dodgy signals are LATE-FLIP (a
-# bucket that reached ≥0.90 then lost the lead — locked-then-moved, the
-# UUWW/Moscow oracle-risk pattern) and a sustained high MISS-rate.
-FLAG_FLIP_RATE = 4.0     # >4 leader changes/event on average (very churny)
+# The flip log is PRE-FILTERED by the daemon to flips where the OUTGOING
+# leader reached the 0.85 trigger zone (sub-0.85 early-day flicker is the
+# market honestly undecided — not logged). So every logged flip is already
+# meaningful: a bucket that reached our decision zone then LOST the lead.
+# flips/event here = trigger-zone dethronings per event; even 1-2 is
+# notable. LATE-FLIP (outgoing leader peaked ≥0.90 = locked-then-moved,
+# the UUWW/Moscow oracle-risk pattern) is the highest-confidence signal,
+# alongside a sustained MISS-rate.
+FLAG_FLIP_RATE = 1.5     # >1.5 trigger-zone dethronings/event (churny/dodgy)
 FLAG_MISS_RATE = 0.40    # >40% of fires on a bucket that didn't win
 FLAG_LATE_FLIP = 1       # any flip where a ≥0.90 leader got dethroned
 LATE_PEAK = 0.90
