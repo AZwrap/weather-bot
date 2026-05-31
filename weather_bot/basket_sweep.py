@@ -178,6 +178,16 @@ async def log_basket_sweep(
             counts["no_new_level"] += 1
             continue
 
+        # Settled / no real live book (YES pinned at ~1.0): nothing left to
+        # trade, the /book is dead. Skip the depth fetch and mark done so we
+        # stop probing it every refresh (and don't pollute the log with
+        # empty rows).
+        if leader_ya >= 0.995:
+            state[key] = hw_now
+            dirty = True
+            counts["skipped_settled"] += 1
+            continue
+
         # New high-water penny reached — fetch depth and snapshot the basket.
         tokens = [leader.yes_token_id]
         for m in ev.markets:
@@ -192,6 +202,12 @@ async def log_basket_sweep(
             m=leader, side="YES", depth=depth_map.get(leader.yes_token_id),
             observed_ask=leader_ya, size_usd=size_usd,
         )
+        if winner is None:
+            # Transient empty winner book (leader_ya < 0.995, so NOT a
+            # settled market). Don't advance state or log — retry next
+            # refresh when the /book may be back.
+            counts["winner_no_book"] += 1
+            continue
         fade_no = []
         for m in ev.markets:
             if m is leader or not m.no_token_id:
