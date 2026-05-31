@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 import signal
 import sys
@@ -122,6 +123,9 @@ class DaemonState:
         self.basket_hw: dict[tuple[str, str, str], int] = {}
         # Guard against unbounded concurrent fire tasks.
         self.basket_fire_inflight: set[tuple[str, str, str]] = set()
+        # Current leading bucket label per sk — used to log leader FLIPS
+        # (data/leader_flips.jsonl) for the station-integrity monitor.
+        self.current_leader: dict[tuple[str, str, str], str] = {}
         self.client = None  # ExecutionClient — see build_client()
         self.intraday_log = load_intraday_log(DEFAULT_INTRADAY_LOG_PATH)
         # Cached prior-day actuals for persistence_tail. Refreshed on
@@ -801,6 +805,19 @@ def _maybe_fire_consensus_yes_exit(state: "DaemonState", msg: dict) -> None:
               f"{target_pos.bucket_label} (entry ${target_pos.entry_price:.3f})")
 
 
+_LEADER_FLIP_LOG = Path("data/leader_flips.jsonl")
+
+
+def _log_leader_flip(record: dict) -> None:
+    """Append a leader-change record for the station-integrity monitor."""
+    try:
+        _LEADER_FLIP_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with _LEADER_FLIP_LOG.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, default=str) + "\n")
+    except (OSError, TypeError, ValueError):
+        pass
+
+
 def _maybe_fire_basket_on_cross(state: "DaemonState", msg: dict) -> None:
     """WS-delta basket trigger — the 'sub-second, no polling' path.
 
@@ -833,14 +850,40 @@ def _maybe_fire_basket_on_cross(state: "DaemonState", msg: dict) -> None:
             continue
         # Fresh leader best-ask across the event's YES tokens (WS cache).
         leader_ya = 0.0
+        leader_m = None
+        runner_up = 0.0
         for m in ev.markets:
             if not m.yes_token_id:
                 continue
             a = state.book_cache.best_ask(m.yes_token_id)
-            if a is not None and a > leader_ya:
+            if a is None:
+                continue
+            if a > leader_ya:
+                runner_up = leader_ya
                 leader_ya = a
-        if leader_ya <= 0:
+                leader_m = m
+            elif a > runner_up:
+                runner_up = a
+        if leader_ya <= 0 or leader_m is None:
             continue
+
+        # Leader-flip log — every time the leading bucket CHANGES, record it
+        # (data/leader_flips.jsonl). Feeds the station-integrity monitor:
+        # frequent/large flips + early-leader≠winner flag dodgy stations
+        # (e.g. operator-flagged Moscow). Cheap: logs only on a real change.
+        leader_label = leader_m.bucket_label
+        if state.current_leader.get(sk) != leader_label:
+            prev_label = state.current_leader.get(sk)
+            state.current_leader[sk] = leader_label
+            if prev_label is not None:  # skip the first observation (no flip)
+                _log_leader_flip({
+                    "ts_utc": datetime.now(timezone.utc).isoformat(),
+                    "station_id": sk[0], "target": sk[1], "target_date": sk[2],
+                    "from_bucket": prev_label, "to_bucket": leader_label,
+                    "to_leader_ask": round(leader_ya, 3),
+                    "runner_up_ask": round(runner_up, 3),
+                })
+
         hw_now = min(int(leader_ya * 100 + 1e-9), 99)
         if hw_now < 70:
             continue
