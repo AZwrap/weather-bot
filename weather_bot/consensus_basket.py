@@ -174,12 +174,23 @@ def _place_leg(
     return "filled"
 
 
+def _fresh_yes_ask(m, book_cache) -> float | None:
+    """Winner trigger price — WS top-of-book (sub-second) when available,
+    else the REST-refreshed snapshot price."""
+    if book_cache is not None and m.yes_token_id:
+        a = book_cache.best_ask(m.yes_token_id)
+        if a is not None:
+            return float(a)
+    return float(m.yes_ask) if m.yes_ask is not None else None
+
+
 async def detect_and_execute_consensus_basket(
     *,
     events: list,
     client: Any,
     portfolio: Portfolio,
     http,
+    book_cache=None,
     portfolio_path: Path = DEFAULT_PORTFOLIO_PATH,
     trigger_yes: float = TRIGGER_YES,
     size_usd: float = SIZE_USD,
@@ -187,7 +198,10 @@ async def detect_and_execute_consensus_basket(
     verbose: bool = False,
 ) -> dict[str, int]:
     """Scan events; when a bucket's YES ≥ trigger, place the hold-to-
-    resolution basket (YES winner + NO every other bucket)."""
+    resolution basket (YES winner + NO every other bucket).
+
+    `book_cache`, when given, supplies the WS-fresh trigger price so this
+    can fire the instant a delta pushes the winner across `trigger_yes`."""
     counts: dict[str, int] = defaultdict(int)
     today_utc = datetime.now(timezone.utc).date()
     attempted = _load_attempted()
@@ -214,15 +228,17 @@ async def detect_and_execute_consensus_basket(
             if m.no_token_id:
                 event_tokens.add(m.no_token_id)
 
-        # Emerged winner = highest-YES bucket, if it's reached the trigger.
+        # Emerged winner = highest-YES bucket, if it's reached the trigger
+        # (WS-fresh price when book_cache supplied).
         winner = None
         winner_ya = 0.0
         for m in ev.markets:
-            if m.yes_ask is None:
+            ya = _fresh_yes_ask(m, book_cache)
+            if ya is None:
                 continue
-            if m.yes_ask > winner_ya:
+            if ya > winner_ya:
                 winner = m
-                winner_ya = float(m.yes_ask)
+                winner_ya = ya
         if winner is None or winner_ya < trigger_yes:
             counts["skipped_no_winner"] += 1
             continue

@@ -122,10 +122,22 @@ def _leg_snapshot(*, m, side: str, depth, observed_ask: float | None,
     }
 
 
+def _fresh_yes_ask(m, book_cache) -> float | None:
+    """Leading-bucket trigger price. Prefer the WS cache's best ask
+    (refreshed sub-second on every price_change delta); fall back to the
+    REST-refreshed snapshot price on the market object."""
+    if book_cache is not None and m.yes_token_id:
+        a = book_cache.best_ask(m.yes_token_id)
+        if a is not None:
+            return float(a)
+    return float(m.yes_ask) if m.yes_ask is not None else None
+
+
 async def log_basket_sweep(
     *,
     events: list,
     http,
+    book_cache=None,
     low: int = LOW_PENNY,
     high: int = HIGH_PENNY,
     size_usd: float = SIZE_USD,
@@ -134,7 +146,12 @@ async def log_basket_sweep(
     verbose: bool = False,
 ) -> dict[str, int]:
     """For each event, if the leading bucket's YES ask has reached a new
-    high-water penny in [low, high], log a shadow basket at that level."""
+    high-water penny in [low, high], log a shadow basket at that level.
+
+    When `book_cache` is supplied, the leader's trigger price is read from
+    the WS top-of-book (sub-second fresh via price_change deltas) instead
+    of the 5-min snapshot — this is what lets the WS-delta path catch a
+    crossing the instant it happens. Fills still depth-walk REST depth."""
     counts: dict[str, int] = defaultdict(int)
     today_utc = datetime.now(timezone.utc).date()
     state = _load_state(state_path)
@@ -154,15 +171,16 @@ async def log_basket_sweep(
         td_iso = td.isoformat()
         key = f"{station.station_id}|{target}|{td_iso}"
 
-        # Leading bucket = highest YES ask.
+        # Leading bucket = highest YES ask (WS-fresh when book_cache given).
         leader = None
         leader_ya = 0.0
         for m in ev.markets:
-            if m.yes_ask is None:
+            ya = _fresh_yes_ask(m, book_cache)
+            if ya is None:
                 continue
-            if m.yes_ask > leader_ya:
+            if ya > leader_ya:
                 leader = m
-                leader_ya = float(m.yes_ask)
+                leader_ya = ya
         if leader is None or not leader.yes_token_id:
             continue
 

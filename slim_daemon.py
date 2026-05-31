@@ -114,6 +114,14 @@ class DaemonState:
         self.events: list = []
         self.events_by_sk: dict[tuple[str, str, str], object] = {}
         self.stations_by_sk: dict[tuple[str, str, str], object] = {}
+        # token_id -> sk, for the WS-delta basket trigger to resolve which
+        # event a price_change belongs to (rebuilt each refresh).
+        self.sk_by_token: dict[str, tuple[str, str, str]] = {}
+        # In-memory high-water penny per sk (basket WS-trigger dedupe):
+        # only spawn a fire task when the leader crosses a NEW penny.
+        self.basket_hw: dict[tuple[str, str, str], int] = {}
+        # Guard against unbounded concurrent fire tasks.
+        self.basket_fire_inflight: set[tuple[str, str, str]] = set()
         self.client = None  # ExecutionClient — see build_client()
         self.intraday_log = load_intraday_log(DEFAULT_INTRADAY_LOG_PATH)
         # Cached prior-day actuals for persistence_tail. Refreshed on
@@ -407,6 +415,17 @@ async def refresh_events_and_pollers(state: DaemonState) -> None:
     state.events_by_sk = new_events_by_sk
     state.stations_by_sk = new_stations_by_sk
 
+    # Reverse index token_id -> sk so the WS price_change handler can map a
+    # delta straight to its event for the sub-second basket trigger.
+    new_sk_by_token: dict[str, tuple[str, str, str]] = {}
+    for sk, ev in new_events_by_sk.items():
+        for m in ev.markets:
+            if m.yes_token_id:
+                new_sk_by_token[m.yes_token_id] = sk
+            if m.no_token_id:
+                new_sk_by_token[m.no_token_id] = sk
+    state.sk_by_token = new_sk_by_token
+
     # Refresh WUG pollers — only run pollers for events that are
     # currently "in flight" in STATION-LOCAL time. The previous version
     # filtered by today_utc, which silently broke US stations after
@@ -540,6 +559,7 @@ async def refresh_events_and_pollers(state: DaemonState) -> None:
             client=state.client,
             portfolio=state.portfolio,
             http=state.http,
+            book_cache=state.book_cache,
             portfolio_path=state.args.portfolio_path,
             verbose=False,
         )
@@ -560,6 +580,7 @@ async def refresh_events_and_pollers(state: DaemonState) -> None:
         sweep_counts = await log_basket_sweep(
             events=list(new_events_by_sk.values()),
             http=state.http,
+            book_cache=state.book_cache,
         )
         if sweep_counts and sweep_counts.get("snapshots", 0) > 0:
             print(f"[sweep-log] snapshots={sweep_counts['snapshots']} "
@@ -780,6 +801,99 @@ def _maybe_fire_consensus_yes_exit(state: "DaemonState", msg: dict) -> None:
               f"{target_pos.bucket_label} (entry ${target_pos.entry_price:.3f})")
 
 
+def _maybe_fire_basket_on_cross(state: "DaemonState", msg: dict) -> None:
+    """WS-delta basket trigger — the 'sub-second, no polling' path.
+
+    On every `price_change` (which carries fresh best_bid/best_ask per
+    token), map the affected token(s) to their event, recompute the
+    leading YES bucket's fresh best ask, and if it just crossed a NEW
+    penny in [0.70, 0.99], spawn a fire task. The task fires the basket
+    legs as independent FAK orders (each fills whatever depth is there,
+    the rest abort) and logs the per-penny sweep snapshot.
+
+    Sync + fast (runs inline in the WS receive loop); all REST/order work
+    is offloaded to an asyncio task so the socket keeps draining.
+    """
+    if msg.get("event_type") != "price_change":
+        return
+    affected: set = set()
+    for ch in msg.get("price_changes", []) or []:
+        aid = ch.get("asset_id")
+        if not aid:
+            continue
+        sk = state.sk_by_token.get(aid)
+        if sk is not None:
+            affected.add(sk)
+    if not affected:
+        return
+
+    for sk in affected:
+        ev = state.events_by_sk.get(sk)
+        if ev is None:
+            continue
+        # Fresh leader best-ask across the event's YES tokens (WS cache).
+        leader_ya = 0.0
+        for m in ev.markets:
+            if not m.yes_token_id:
+                continue
+            a = state.book_cache.best_ask(m.yes_token_id)
+            if a is not None and a > leader_ya:
+                leader_ya = a
+        if leader_ya <= 0:
+            continue
+        hw_now = min(int(leader_ya * 100 + 1e-9), 99)
+        if hw_now < 70:
+            continue
+        prev = state.basket_hw.get(sk, 69)
+        if hw_now <= prev:
+            continue
+        # New penny crossing → advance high-water + spawn one fire task.
+        state.basket_hw[sk] = hw_now
+        if sk in state.basket_fire_inflight:
+            continue
+        state.basket_fire_inflight.add(sk)
+        try:
+            asyncio.get_running_loop().create_task(
+                _fire_basket_cross(state, sk, hw_now))
+        except RuntimeError:
+            state.basket_fire_inflight.discard(sk)
+
+
+async def _fire_basket_cross(state: "DaemonState", sk, hw_now: int) -> None:
+    """Off-socket task: depth-walk + parallel-FAK fire for one event whose
+    leader just crossed a new penny. Reuses the tested basket functions
+    (which fetch REST depth + dedupe); book_cache feeds them the WS-fresh
+    trigger price so the crossing is acted on immediately."""
+    try:
+        ev = state.events_by_sk.get(sk)
+        if ev is None:
+            return
+        # Per-penny shadow sweep snapshot (REST depth, fee-applied).
+        try:
+            await log_basket_sweep(
+                events=[ev], http=state.http, book_cache=state.book_cache)
+        except Exception as exc:
+            print(f"[basket-cross sweep] {sk}: {type(exc).__name__}: {exc}",
+                  file=sys.stderr)
+        # Real paper basket — fires only if the winner is ≥ trigger and the
+        # event hasn't been attempted yet. Legs are independent FAK: each
+        # fills to available depth, the rest abort ($0).
+        try:
+            counts = await detect_and_execute_consensus_basket(
+                events=[ev], client=state.client, portfolio=state.portfolio,
+                http=state.http, book_cache=state.book_cache,
+                portfolio_path=state.args.portfolio_path,
+            )
+            if counts.get("baskets_placed", 0) > 0:
+                print(f"[basket-cross] {sk[0]}/{sk[1]} fired at {hw_now}¢ "
+                      f"legs_filled={counts.get('legs_filled', 0)}")
+        except Exception as exc:
+            print(f"[basket-cross fire] {sk}: {type(exc).__name__}: {exc}",
+                  file=sys.stderr)
+    finally:
+        state.basket_fire_inflight.discard(sk)
+
+
 async def _refresh_ws_subscription(state: DaemonState, no_tokens: list[str]) -> None:
     """Restart the WS subscription with the current token set. Older
     task is cancelled first; clean cancellation is the priority over
@@ -806,9 +920,11 @@ async def _refresh_ws_subscription(state: DaemonState, no_tokens: list[str]) -> 
                     if isinstance(sub, dict):
                         state.book_cache.on_book_message(sub)
                         _maybe_fire_consensus_yes_exit(state, sub)
+                        _maybe_fire_basket_on_cross(state, sub)
             elif isinstance(msg, dict):
                 state.book_cache.on_book_message(msg)
                 _maybe_fire_consensus_yes_exit(state, msg)
+                _maybe_fire_basket_on_cross(state, msg)
         except Exception as exc:
             print(f"[ws] on_book_message failed: {exc}", file=sys.stderr)
 

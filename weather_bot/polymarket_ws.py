@@ -234,9 +234,6 @@ class BookCache:
     def on_book_message(self, msg: dict) -> None:
         """Callback compatible with subscribe_and_watch.on_message."""
         event_type = msg.get("event_type")
-        asset_id = msg.get("asset_id") or msg.get("market") or ""
-        if not asset_id:
-            return
 
         if event_type == "book":
             # Full snapshot. Polymarket sends `bids` and `asks` as lists
@@ -244,34 +241,55 @@ class BookCache:
             # prior `book_invalidated` flag — a fresh full snapshot is
             # the source of truth, replacing whatever the delta stream
             # had previously made stale (audit finding C1).
+            asset_id = msg.get("asset_id") or msg.get("market") or ""
+            if not asset_id:
+                return
             bids = msg.get("bids", [])
             asks = msg.get("asks", [])
             bid = self._best_price(bids, side="bid")
             ask = self._best_price(asks, side="ask")
             self._update(asset_id, bid=bid, ask=ask, bids=bids, asks=asks)
         elif event_type == "price_change":
-            # Delta arrival — we don't maintain full book state, so we
-            # INVALIDATE the cached bid/ask. Callers asking for a fresh
-            # reading will see None and fall back to REST. This is
-            # SAFER than serving stale prices. A future iteration could
-            # apply the delta to maintain the book. A subsequent `book`
-            # snapshot clears the flag (handled by _update).
-            entry = self._cache.setdefault(asset_id, {})
-            entry["last_event"] = "price_change"
-            entry["last_seen_at_ts"] = time.time()
-            entry["book_invalidated"] = True
+            # A price_change delta carries the FRESH best_bid/best_ask for
+            # each affected token DIRECTLY (verified live 2026-05-31):
+            #   {"price_changes": [{"asset_id","side","best_bid","best_ask"}…]}
+            # Note: there is NO top-level asset_id — the token id is inside
+            # each entry (the old code keyed by `market`, which was wrong).
+            #
+            # We update the cached TOP-OF-BOOK per token from the delta —
+            # this keeps best_ask/best_bid sub-second-fresh BETWEEN full
+            # `book` snapshots (previously the cache just invalidated and
+            # served None → the "2% fresh" problem). The full LADDER is NOT
+            # in the delta, so we mark it stale (book_invalidated); get_depth
+            # then declines the snapshot ladder and uses REST-seeded depth.
+            now = time.time()
+            for ch in msg.get("price_changes", []) or []:
+                aid = ch.get("asset_id")
+                if not aid:
+                    continue
+                entry = self._cache.setdefault(aid, {})
+                try:
+                    bb = ch.get("best_bid")
+                    ba = ch.get("best_ask")
+                    if bb is not None:
+                        entry["bid"] = float(bb)
+                    if ba is not None:
+                        entry["ask"] = float(ba)
+                except (TypeError, ValueError):
+                    pass
+                entry["updated_at_ts"] = now
+                entry["last_event"] = "price_change"
+                entry["last_seen_at_ts"] = now
+                # Ladder is stale (delta has no levels); top-of-book is fresh.
+                entry["book_invalidated"] = True
 
     def best_bid(self, token_id: str) -> Optional[float]:
-        entry = self._cache.get(token_id, {})
-        if entry.get("book_invalidated"):
-            return None
-        return entry.get("bid")
+        # book_invalidated marks the LADDER stale, not the top-of-book —
+        # price_change deltas refresh bid/ask, so we return them.
+        return self._cache.get(token_id, {}).get("bid")
 
     def best_ask(self, token_id: str) -> Optional[float]:
-        entry = self._cache.get(token_id, {})
-        if entry.get("book_invalidated"):
-            return None
-        return entry.get("ask")
+        return self._cache.get(token_id, {}).get("ask")
 
     def fresh_best_ask(
         self, token_id: str, max_age_seconds: float = 30.0,
@@ -286,10 +304,12 @@ class BookCache:
         Caller should fall back to REST data when None is returned.
         Use case: Layer 7 / Layer 8 prefer sub-second WS data when
         available; otherwise use the cycle's REST-refreshed snapshot.
+
+        NOTE: top-of-book is refreshed by BOTH `book` snapshots AND
+        `price_change` deltas (the delta carries best_bid/best_ask), so
+        this is NOT gated on book_invalidated — only on staleness.
         """
         entry = self._cache.get(token_id, {})
-        if entry.get("book_invalidated"):
-            return None
         ask = entry.get("ask")
         ts = entry.get("updated_at_ts")
         if ask is None or ts is None:
@@ -304,8 +324,6 @@ class BookCache:
     ) -> Optional[float]:
         """Like fresh_best_ask but for the bid side."""
         entry = self._cache.get(token_id, {})
-        if entry.get("book_invalidated"):
-            return None
         bid = entry.get("bid")
         ts = entry.get("updated_at_ts")
         if bid is None or ts is None:
