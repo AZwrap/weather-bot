@@ -84,6 +84,12 @@ KILL_SWITCH = Path("KILL_SWITCH")
 # only after the publication-window harness validates strategies.
 PAPER_ONLY: bool = True
 
+# consensus_yes DISABLED 2026-05-31 — paper control returned its verdict:
+# −$312 over 304 trades @ 24% win (the NO_momentum spread-bleed again).
+# Entry + both exit paths are gated off; logs retained. The 5 open
+# positions just ride to resolution. Flip True to re-enable.
+CONSENSUS_YES_ENABLED: bool = False
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -300,21 +306,23 @@ async def on_wug_update(state: DaemonState, upd: WUGUpdate) -> None:
         print(f"  [pers-tail] failed: {type(exc).__name__}: {exc}",
               file=sys.stderr)
 
-    # 5) Consensus YES momentum — buy the leading mid bucket while it's
-    # in the trade-able band. HIGHEST-RISK strategy in the rebuild —
-    # closest path back to the prior NO_momentum bleed. Paper-only.
+    # 5) Consensus YES momentum — DISABLED (see CONSENSUS_YES_ENABLED).
+    # Bled −$312/304 trades in paper; the NO_momentum spread-bleed again.
     try:
-        counts = detect_and_execute_consensus_yes(
-            station_id=upd.station_id,
-            target_date_iso=upd.target_date_iso,
-            target=upd.target,
-            bucket_snapshots=list(ev.markets),
-            client=state.client,
-            portfolio=state.portfolio,
-            portfolio_path=state.args.portfolio_path,
-            depth_map=depth_map,
-            verbose=False,
-        )
+        if not CONSENSUS_YES_ENABLED:
+            counts = {}
+        else:
+            counts = detect_and_execute_consensus_yes(
+                station_id=upd.station_id,
+                target_date_iso=upd.target_date_iso,
+                target=upd.target,
+                bucket_snapshots=list(ev.markets),
+                client=state.client,
+                portfolio=state.portfolio,
+                portfolio_path=state.args.portfolio_path,
+                depth_map=depth_map,
+                verbose=False,
+            )
         if counts and counts.get("placed", 0) > 0:
             print(f"  [cons-yes] placed={counts['placed']}")
     except Exception as exc:
@@ -534,11 +542,10 @@ async def refresh_events_and_pollers(state: DaemonState) -> None:
         print(f"[cons-arb] failed: {type(exc).__name__}: {exc}",
               file=sys.stderr)
 
-    # Consensus-YES trailing exit — walks open consensus_yes positions
-    # and sells the ones whose price came back down ≥ peak_decline_ticks
-    # below their peak while still ≥ entry + 5pp profit. Paper-only.
+    # Consensus-YES trailing exit — DISABLED with the strategy. The 5 open
+    # positions ride to resolution rather than bleeding more spread on exit.
     try:
-        exit_counts = evaluate_consensus_yes_exits(
+        exit_counts = {} if not CONSENSUS_YES_ENABLED else evaluate_consensus_yes_exits(
             events=list(new_events_by_sk.values()),
             client=state.client,
             portfolio=state.portfolio,
@@ -768,6 +775,8 @@ def _maybe_fire_consensus_yes_exit(state: "DaemonState", msg: dict) -> None:
     marks the book as invalidated so fresh_best_ask returns None — in
     that case we skip until the next snapshot.
     """
+    if not CONSENSUS_YES_ENABLED:
+        return  # strategy disabled — open positions ride to resolution
     asset_id = msg.get("asset_id") or msg.get("market")
     if not asset_id:
         return
