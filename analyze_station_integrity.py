@@ -75,8 +75,13 @@ def _rounded_obs(actual_c, unit):
     return int(math.floor(actual_c + 0.05))
 
 
+MIN_PEAK = 0.70  # mirror the daemon's FLIP_LOG_MIN_PEAK — defensive guard
+# against stale pre-filter / deploy-race leftovers polluting the dataset.
+
+
 def main() -> int:
-    flips = load_jsonl(FLIP_LOG)
+    flips = [f for f in load_jsonl(FLIP_LOG)
+             if float(f.get("from_peak_ask", 0) or 0) >= MIN_PEAK]
     basket = [r for r in load_jsonl(BASKET_LOG) if r.get("result") == "filled"]
     res = load_jsonl(FORWARD_LOG)
     units = {}
