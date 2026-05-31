@@ -41,6 +41,14 @@ from .portfolio import DEFAULT_PORTFOLIO_PATH, Portfolio, Position, region_for
 from .scanner import TradeSignal
 
 DEFAULT_LOG_PATH = Path("data/consensus_basket_log.jsonl")
+ATTEMPTED_PATH = Path("data/consensus_basket_attempted.json")
+"""Persisted set of (station|target|date) keys we've already tried a
+basket for. A basket is a once-per-event-per-day shot: when the winner
+emerges at $0.85 we build it once. Without this guard, an event whose
+legs all fail to fill (dead /book near resolution → 0 positions → the
+position-based dedupe can't catch it) would re-trigger every refresh
+and re-fetch depth for ~10 dead tokens, risking a Cloudflare rate-limit
+ban (the arb playbook warns ≳5 RPS trips 429/1015)."""
 
 TRIGGER_YES: float = 0.85
 """A bucket's YES ask must reach this for it to count as the emerged
@@ -66,6 +74,21 @@ def _log(record: dict, log_path: Path = DEFAULT_LOG_PATH) -> None:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         with log_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record, default=str) + "\n")
+    except (OSError, TypeError, ValueError):
+        pass
+
+
+def _load_attempted(path: Path = ATTEMPTED_PATH) -> set[str]:
+    try:
+        return set(json.loads(path.read_text(encoding="utf-8")))
+    except (OSError, ValueError, TypeError):
+        return set()
+
+
+def _save_attempted(keys: set[str], path: Path = ATTEMPTED_PATH) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(sorted(keys)), encoding="utf-8")
     except (OSError, TypeError, ValueError):
         pass
 
@@ -175,6 +198,8 @@ async def detect_and_execute_consensus_basket(
     resolution basket (YES winner + NO every other bucket)."""
     counts: dict[str, int] = defaultdict(int)
     today_utc = datetime.now(timezone.utc).date()
+    attempted = _load_attempted()
+    attempted_dirty = False
 
     for ev in events:
         station = match_event_to_station(ev)
@@ -212,7 +237,8 @@ async def detect_and_execute_consensus_basket(
         if not winner.yes_token_id:
             counts["skipped_winner_no_token"] += 1
             continue
-        if _already_placed(portfolio, event_tokens):
+        attempt_key = f"{station.station_id}|{target}|{td_iso}"
+        if attempt_key in attempted or _already_placed(portfolio, event_tokens):
             counts["skipped_already_placed"] += 1
             continue
 
@@ -264,9 +290,16 @@ async def detect_and_execute_consensus_basket(
             portfolio.save(portfolio_path)
         except Exception:
             pass
+        # Mark attempted regardless of fill outcome — a basket is a
+        # once-per-event shot. Even a 0-fill (dead /book) attempt must
+        # not re-trigger every refresh (REST-storm / rate-limit guard).
+        attempted.add(attempt_key)
+        attempted_dirty = True
         counts["baskets_placed"] += 1
         counts["legs_filled"] += legs_filled
         if verbose:
             print(f"  [basket] {station.station_id}: {legs_filled} legs filled")
 
+    if attempted_dirty:
+        _save_attempted(attempted)
     return dict(counts)
