@@ -35,6 +35,7 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
 
 import httpx
 
+from weather_bot.basket_sweep import log_basket_sweep
 from weather_bot.consensus_basket import detect_and_execute_consensus_basket
 from weather_bot.consensus_yes import (
     detect_and_execute_consensus_yes,
@@ -547,6 +548,24 @@ async def refresh_events_and_pollers(state: DaemonState) -> None:
                   f"legs_filled={basket_counts.get('legs_filled', 0)}")
     except Exception as exc:
         print(f"[cons-basket] failed: {type(exc).__name__}: {exc}",
+              file=sys.stderr)
+
+    # Basket threshold SWEEP — SHADOW logger (no orders). Each time an
+    # event's leading-bucket YES reaches a new high-water penny in
+    # [0.70, 0.99], record a shadow basket (winner YES + all fade NO,
+    # depth-walked + fee-applied) so analyze_basket_sweep.py can build
+    # the per-station P&L-vs-trigger curve for tuning. Bounded REST:
+    # one depth fetch per event per new penny level (≤30/event/day).
+    try:
+        sweep_counts = await log_basket_sweep(
+            events=list(new_events_by_sk.values()),
+            http=state.http,
+        )
+        if sweep_counts and sweep_counts.get("snapshots", 0) > 0:
+            print(f"[sweep-log] snapshots={sweep_counts['snapshots']} "
+                  f"levels_advanced={sweep_counts.get('levels_advanced', 0)}")
+    except Exception as exc:
+        print(f"[sweep-log] failed: {type(exc).__name__}: {exc}",
               file=sys.stderr)
 
     # NOTE: the daily resolver used to run HERE, inside every 5-min
