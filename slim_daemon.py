@@ -123,9 +123,10 @@ class DaemonState:
         self.basket_hw: dict[tuple[str, str, str], int] = {}
         # Guard against unbounded concurrent fire tasks.
         self.basket_fire_inflight: set[tuple[str, str, str]] = set()
-        # Current leading bucket label per sk — used to log leader FLIPS
-        # (data/leader_flips.jsonl) for the station-integrity monitor.
-        self.current_leader: dict[tuple[str, str, str], str] = {}
+        # Current leading bucket per sk as (bucket_label, peak_ask_while_leading)
+        # — used to log leader FLIPS (data/leader_flips.jsonl) and classify
+        # "late" flips (a ≥0.90 leader that got dethroned) for the monitor.
+        self.current_leader: dict[tuple[str, str, str], tuple[str, float]] = {}
         self.client = None  # ExecutionClient — see build_client()
         self.intraday_log = load_intraday_log(DEFAULT_INTRADAY_LOG_PATH)
         # Cached prior-day actuals for persistence_tail. Refreshed on
@@ -868,21 +869,28 @@ def _maybe_fire_basket_on_cross(state: "DaemonState", msg: dict) -> None:
             continue
 
         # Leader-flip log — every time the leading bucket CHANGES, record it
-        # (data/leader_flips.jsonl). Feeds the station-integrity monitor:
-        # frequent/large flips + early-leader≠winner flag dodgy stations
-        # (e.g. operator-flagged Moscow). Cheap: logs only on a real change.
+        # (data/leader_flips.jsonl). Feeds the station-integrity monitor.
+        # We track the OUTGOING leader's PEAK ask while it led, so a flip can
+        # be classified "late" = a bucket that REACHED ≥0.90 (looked locked)
+        # then got dethroned — the UUWW/Moscow oracle-risk signature. (A flip
+        # merely INTO a high price is just normal convergence, not suspect.)
         leader_label = leader_m.bucket_label
-        if state.current_leader.get(sk) != leader_label:
-            prev_label = state.current_leader.get(sk)
-            state.current_leader[sk] = leader_label
-            if prev_label is not None:  # skip the first observation (no flip)
-                _log_leader_flip({
-                    "ts_utc": datetime.now(timezone.utc).isoformat(),
-                    "station_id": sk[0], "target": sk[1], "target_date": sk[2],
-                    "from_bucket": prev_label, "to_bucket": leader_label,
-                    "to_leader_ask": round(leader_ya, 3),
-                    "runner_up_ask": round(runner_up, 3),
-                })
+        cur = state.current_leader.get(sk)   # (label, peak_ask) or None
+        if cur is None:
+            state.current_leader[sk] = (leader_label, leader_ya)
+        elif cur[0] == leader_label:
+            if leader_ya > cur[1]:           # same leader — track its peak
+                state.current_leader[sk] = (leader_label, leader_ya)
+        else:
+            prev_label, prev_peak = cur      # leader CHANGED → log the flip
+            state.current_leader[sk] = (leader_label, leader_ya)
+            _log_leader_flip({
+                "ts_utc": datetime.now(timezone.utc).isoformat(),
+                "station_id": sk[0], "target": sk[1], "target_date": sk[2],
+                "from_bucket": prev_label, "from_peak_ask": round(prev_peak, 3),
+                "to_bucket": leader_label, "to_leader_ask": round(leader_ya, 3),
+                "runner_up_ask": round(runner_up, 3),
+            })
 
         hw_now = min(int(leader_ya * 100 + 1e-9), 99)
         if hw_now < 70:

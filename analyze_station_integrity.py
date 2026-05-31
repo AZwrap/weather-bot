@@ -41,9 +41,15 @@ BASKET_LOG = DATA / "consensus_basket_log.jsonl"
 FORWARD_LOG = DATA / "forward_log.jsonl"
 
 # Flag thresholds (review candidates; tune as data accumulates).
-FLAG_FLIP_RATE = 2.0     # >2 leader changes/event on average
+# NOTE: early-day temperature markets legitimately flicker between
+# adjacent buckets before the extreme forms — so a high flip-rate ALONE
+# is weak signal. The high-confidence dodgy signals are LATE-FLIP (a
+# bucket that reached ≥0.90 then lost the lead — locked-then-moved, the
+# UUWW/Moscow oracle-risk pattern) and a sustained high MISS-rate.
+FLAG_FLIP_RATE = 4.0     # >4 leader changes/event on average (very churny)
 FLAG_MISS_RATE = 0.40    # >40% of fires on a bucket that didn't win
-FLAG_LATE_FLIP = 1       # any flip after the leader was ≥0.90
+FLAG_LATE_FLIP = 1       # any flip where a ≥0.90 leader got dethroned
+LATE_PEAK = 0.90
 
 
 def load_jsonl(p: Path) -> list[dict]:
@@ -99,8 +105,10 @@ def main() -> int:
                 st_reversals[sid] += 1
             seen.add(b)
         for f in fs:
-            if float(f.get("runner_up_ask", 0) or 0) >= 0.90 or float(f.get("to_leader_ask", 0) or 0) >= 0.90:
-                # a flip while a bucket was already ≥0.90 = late, suspicious
+            # LATE = the OUTGOING leader had peaked ≥0.90 (looked locked) and
+            # then lost the lead. This is the locked-then-moved signature, not
+            # a normal flip INTO a high price.
+            if float(f.get("from_peak_ask", 0) or 0) >= LATE_PEAK:
                 st_late[sid] += 1
 
     # --- miss rate: fired-bucket vs resolved winner ---
