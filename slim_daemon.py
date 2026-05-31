@@ -35,6 +35,7 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
 
 import httpx
 
+from weather_bot.consensus_basket import detect_and_execute_consensus_basket
 from weather_bot.consensus_yes import (
     detect_and_execute_consensus_yes,
     evaluate_consensus_yes_exits,
@@ -522,6 +523,30 @@ async def refresh_events_and_pollers(state: DaemonState) -> None:
                   f"holding={exit_counts.get('holding', 0)}")
     except Exception as exc:
         print(f"[cons-yes-exit] failed: {type(exc).__name__}: {exc}",
+              file=sys.stderr)
+
+    # Consensus BASKET — when a bucket's YES ≥ 0.85 (the emerged winner),
+    # buy YES $5 on it + NO $5 on every other bucket, then HOLD to
+    # resolution (no exit). This is the operator's hold-to-resolution
+    # answer to consensus_yes's spread-bleed. Runs here on the freshly
+    # repriced event set (5-min cadence) so it catches a 0.85 crossing
+    # whether it came from an extreme move or pure market repricing.
+    # Fetches depth itself, only for events that actually trigger
+    # (rare), so the extra REST is bounded. Paper-only.
+    try:
+        basket_counts = await detect_and_execute_consensus_basket(
+            events=list(new_events_by_sk.values()),
+            client=state.client,
+            portfolio=state.portfolio,
+            http=state.http,
+            portfolio_path=state.args.portfolio_path,
+            verbose=False,
+        )
+        if basket_counts and basket_counts.get("baskets_placed", 0) > 0:
+            print(f"[cons-basket] baskets={basket_counts['baskets_placed']} "
+                  f"legs_filled={basket_counts.get('legs_filled', 0)}")
+    except Exception as exc:
+        print(f"[cons-basket] failed: {type(exc).__name__}: {exc}",
               file=sys.stderr)
 
     # NOTE: the daily resolver used to run HERE, inside every 5-min

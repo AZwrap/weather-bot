@@ -27,3 +27,6 @@ Thumbs.db
 *.key
 *.pem
 checkpoints/
+
+# Claude Code scratch/worktrees
+.claude/
