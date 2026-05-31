@@ -315,44 +315,65 @@ class BookCache:
             return None
         return float(bid)
 
-    def get_depth(self, token_id: str, max_age_seconds: float = 30.0):
-        """Return an OrderBookDepth built from the cached ladder, or None
-        if the book is invalidated / stale / never seen. Lets the NO-side
-        sweep depth-walk SYNCHRONOUSLY from the WS stream — no REST call.
+    # How long a REST-seeded depth (from seed_depth) stays usable. The
+    # depth comes from on_wug_update's fetch_orderbook_depths_batch, which
+    # fires when a station's extreme moves; 90s keeps the sweep
+    # depth-walking the just-moved event without re-fetching.
+    REST_DEPTH_TTL_S: float = 90.0
 
-        Returns None (not a partial) when invalidated by a price_change
-        delta, so the caller falls back to top-of-book rather than walking
-        a stale ladder.
+    def seed_depth(self, token_id: str, depth, ttl_seconds: float = None) -> None:
+        """Inject a REST-fetched OrderBookDepth into the cache so the
+        synchronous sweep can depth-walk it. Polymarket's WS doesn't
+        snapshot on subscribe (verified: ~2% of tokens ever get a WS
+        ladder), so this opportunistic seed — reusing depth on_wug_update
+        already fetched — is what actually feeds the sweep's depth-walk
+        for active/moving events. Zero extra network."""
+        if depth is None:
+            return
+        entry = self._cache.setdefault(token_id, {})
+        entry["rest_depth"] = depth
+        entry["rest_depth_ts"] = time.time()
+
+    def get_depth(self, token_id: str, max_age_seconds: float = 30.0):
+        """Return an OrderBookDepth for a synchronous depth-walk, or None.
+
+        Preference: (1) the live WS ladder if fresh + not delta-
+        invalidated; (2) a REST-seeded depth (seed_depth) within
+        REST_DEPTH_TTL_S. None → caller falls back to top-of-book.
         """
         from weather_bot.polymarket import OrderBookDepth, OrderBookLevel
         entry = self._cache.get(token_id, {})
-        if entry.get("book_invalidated"):
-            return None
-        ts = entry.get("updated_at_ts")
-        if ts is None or (time.time() - float(ts)) > max_age_seconds:
-            return None
-        raw_bids = entry.get("bids_raw")
-        raw_asks = entry.get("asks_raw")
-        if raw_bids is None and raw_asks is None:
-            return None
 
-        def _parse(levels):
-            out = []
-            for lv in levels or []:
-                try:
-                    p = float(lv.get("price", 0)); s = float(lv.get("size", 0))
-                    if p > 0 and s > 0:
-                        out.append(OrderBookLevel(price=p, size_shares=s))
-                except (TypeError, ValueError, AttributeError):
-                    continue
-            return out
+        # (1) WS ladder — sub-second, preferred when present + valid.
+        if not entry.get("book_invalidated"):
+            ts = entry.get("updated_at_ts")
+            raw_bids = entry.get("bids_raw")
+            raw_asks = entry.get("asks_raw")
+            if (ts is not None and (time.time() - float(ts)) <= max_age_seconds
+                    and (raw_bids is not None or raw_asks is not None)):
+                def _parse(levels):
+                    out = []
+                    for lv in levels or []:
+                        try:
+                            p = float(lv.get("price", 0)); s = float(lv.get("size", 0))
+                            if p > 0 and s > 0:
+                                out.append(OrderBookLevel(price=p, size_shares=s))
+                        except (TypeError, ValueError, AttributeError):
+                            continue
+                    return out
+                bids = sorted(_parse(raw_bids), key=lambda lv: -lv.price)
+                asks = sorted(_parse(raw_asks), key=lambda lv: lv.price)
+                return OrderBookDepth(
+                    token_id=token_id, bids=bids, asks=asks,
+                    tick_size=0.01, min_order_size=5,
+                )
 
-        bids = sorted(_parse(raw_bids), key=lambda lv: -lv.price)  # best first
-        asks = sorted(_parse(raw_asks), key=lambda lv: lv.price)
-        return OrderBookDepth(
-            token_id=token_id, bids=bids, asks=asks,
-            tick_size=0.01, min_order_size=5,
-        )
+        # (2) REST-seeded depth fallback.
+        rd = entry.get("rest_depth")
+        rts = entry.get("rest_depth_ts")
+        if rd is not None and rts is not None and (time.time() - float(rts)) <= self.REST_DEPTH_TTL_S:
+            return rd
+        return None
 
     def updated_at(self, token_id: str) -> Optional[str]:
         entry = self._cache.get(token_id, {})

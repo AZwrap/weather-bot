@@ -201,6 +201,13 @@ async def on_wug_update(state: DaemonState, upd: WUGUpdate) -> None:
                 tokens.append(m.yes_token_id)
         if tokens:
             depth_map = await fetch_orderbook_depths_batch(tokens, state.http)
+            # Seed the WS cache with this REST depth so the 5s sweep can
+            # depth-walk this just-moved event for ~90s without re-fetching
+            # (Polymarket WS doesn't snapshot on subscribe → ~2% WS-fresh,
+            # so this is what actually feeds the sweep's depth-walk).
+            for tok, d in depth_map.items():
+                if d is not None:
+                    state.book_cache.seed_depth(tok, d)
     except Exception as exc:
         print(f"  [depth] fetch failed: {type(exc).__name__}: {exc}",
               file=sys.stderr)
