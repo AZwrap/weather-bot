@@ -43,6 +43,7 @@ from .polymarket import (
     parse_bucket,
     simulate_buy_fill,
 )
+from .publication_window import midend_local_utc
 
 DEFAULT_LOG_PATH = Path("data/basket_sweep_log.jsonl")
 DEFAULT_STATE_PATH = Path("data/basket_sweep_state.json")
@@ -138,6 +139,7 @@ async def log_basket_sweep(
     events: list,
     http,
     book_cache=None,
+    leader_state=None,
     low: int = LOW_PENNY,
     high: int = HIGH_PENNY,
     size_usd: float = SIZE_USD,
@@ -237,14 +239,35 @@ async def log_basket_sweep(
 
         total_net_cost = (winner["net_cost"] if winner else 0.0) + sum(
             l["net_cost"] for l in fade_no)
+
+        # Time-gate + stability context, so all three "when to fire" levers
+        # (raise-trigger = entry_threshold, time-gate, stability-gate) are
+        # calibratable from this one per-crossing row across 0.70–0.99.
+        now_dt = datetime.now(timezone.utc)
+        local_hour = hours_to_midend = None
+        try:
+            midend = midend_local_utc(td, station)
+            hours_to_midend = round((midend - now_dt).total_seconds() / 3600.0, 2)
+            local_hour = round((24.0 - hours_to_midend) % 24.0, 1)  # 0=day start
+        except Exception:
+            pass
+        leader_dwell_s = None   # how long this leader has held the lead
+        if leader_state is not None:
+            ls = leader_state.get((station.station_id, target, td_iso))
+            if ls is not None and len(ls) >= 3 and ls[0] == leader.bucket_label:
+                leader_dwell_s = round(now_dt.timestamp() - float(ls[2]), 1)
+
         _log({
-            "ts_utc": _now(),
+            "ts_utc": now_dt.isoformat(),
             "station_id": station.station_id,
             "target": target,
             "target_date": td_iso,
             "entry_threshold": hw_now,          # penny bin actually observed
             "prev_high_water": prev,            # last penny logged (skip-gap audit)
             "leader_yes_ask": leader_ya,
+            "local_hour": local_hour,           # time-gate: station-local hour
+            "hours_to_midend": hours_to_midend, # time-gate: hrs to window-end
+            "leader_dwell_s": leader_dwell_s,   # stability-gate: leader dwell
             "winner": winner,                   # None only if winner book vanished
             "fade_no": fade_no,
             "n_no_legs": len(fade_no),

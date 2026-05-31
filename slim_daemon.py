@@ -123,10 +123,11 @@ class DaemonState:
         self.basket_hw: dict[tuple[str, str, str], int] = {}
         # Guard against unbounded concurrent fire tasks.
         self.basket_fire_inflight: set[tuple[str, str, str]] = set()
-        # Current leading bucket per sk as (bucket_label, peak_ask_while_leading)
-        # — used to log leader FLIPS (data/leader_flips.jsonl) and classify
-        # "late" flips (a ≥0.90 leader that got dethroned) for the monitor.
-        self.current_leader: dict[tuple[str, str, str], tuple[str, float]] = {}
+        # Current leading bucket per sk as (bucket_label, peak_ask_while_leading,
+        # became_at_ts) — used to log leader FLIPS (data/leader_flips.jsonl),
+        # classify "late" flips (a ≥0.90 leader dethroned), and supply the
+        # leader-dwell (stability-gate) field to the basket sweep.
+        self.current_leader: dict[tuple[str, str, str], tuple[str, float, float]] = {}
         self.client = None  # ExecutionClient — see build_client()
         self.intraday_log = load_intraday_log(DEFAULT_INTRADAY_LOG_PATH)
         # Cached prior-day actuals for persistence_tail. Refreshed on
@@ -586,6 +587,7 @@ async def refresh_events_and_pollers(state: DaemonState) -> None:
             events=list(new_events_by_sk.values()),
             http=state.http,
             book_cache=state.book_cache,
+            leader_state=state.current_leader,
         )
         if sweep_counts and sweep_counts.get("snapshots", 0) > 0:
             print(f"[sweep-log] snapshots={sweep_counts['snapshots']} "
@@ -883,22 +885,27 @@ def _maybe_fire_basket_on_cross(state: "DaemonState", msg: dict) -> None:
         # then got dethroned — the UUWW/Moscow oracle-risk signature. (A flip
         # merely INTO a high price is just normal convergence, not suspect.)
         leader_label = leader_m.bucket_label
-        cur = state.current_leader.get(sk)   # (label, peak_ask) or None
+        now_dt = datetime.now(timezone.utc)
+        now_ts = now_dt.timestamp()
+        cur = state.current_leader.get(sk)   # (label, peak_ask, became_at_ts) or None
         if cur is None:
-            state.current_leader[sk] = (leader_label, leader_ya)
+            state.current_leader[sk] = (leader_label, leader_ya, now_ts)
         elif cur[0] == leader_label:
             if leader_ya > cur[1]:           # same leader — track its peak
-                state.current_leader[sk] = (leader_label, leader_ya)
+                state.current_leader[sk] = (leader_label, leader_ya, cur[2])
         else:
-            prev_label, prev_peak = cur      # leader CHANGED
-            state.current_leader[sk] = (leader_label, leader_ya)
+            prev_label, prev_peak, prev_since = cur   # leader CHANGED
+            state.current_leader[sk] = (leader_label, leader_ya, now_ts)
             # Log if the OUTGOING leader entered the 0.70–0.99 contention
             # band (complete calibration dataset); skip sub-0.70 flicker.
+            # from_dwell_s = how long the dethroned leader held = direct
+            # stability signal (short dwell before losing = unstable).
             if prev_peak >= FLIP_LOG_MIN_PEAK:
                 _log_leader_flip({
-                    "ts_utc": datetime.now(timezone.utc).isoformat(),
+                    "ts_utc": now_dt.isoformat(),
                     "station_id": sk[0], "target": sk[1], "target_date": sk[2],
                     "from_bucket": prev_label, "from_peak_ask": round(prev_peak, 3),
+                    "from_dwell_s": round(now_ts - prev_since, 1),
                     "to_bucket": leader_label, "to_leader_ask": round(leader_ya, 3),
                     "runner_up_ask": round(runner_up, 3),
                 })
@@ -933,7 +940,8 @@ async def _fire_basket_cross(state: "DaemonState", sk, hw_now: int) -> None:
         # Per-penny shadow sweep snapshot (REST depth, fee-applied).
         try:
             await log_basket_sweep(
-                events=[ev], http=state.http, book_cache=state.book_cache)
+                events=[ev], http=state.http, book_cache=state.book_cache,
+                leader_state=state.current_leader)
         except Exception as exc:
             print(f"[basket-cross sweep] {sk}: {type(exc).__name__}: {exc}",
                   file=sys.stderr)
