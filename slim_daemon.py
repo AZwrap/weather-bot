@@ -525,10 +525,19 @@ async def refresh_events_and_pollers(state: DaemonState) -> None:
     # _resolver_loop() spawned in main_async. Resolutions only update
     # once/day so 30 min is plenty.
 
+    # ws_fresh = tokens whose WS book is fresh enough to serve a read
+    # RIGHT NOW. If this stays ~0, Polymarket isn't sending book
+    # snapshots on subscribe and we need a cold-start REST seed (the
+    # arb playbook's L1 lesson) — the sweep would otherwise fall back to
+    # top-of-book everywhere.
+    try:
+        ws_fresh = state.book_cache.fresh_size(max_age_seconds=120.0)
+    except Exception:
+        ws_fresh = -1
     print(
         f"[refresh] {now_utc.isoformat()}  events={len(events)}  "
         f"active_sk={len(new_events_by_sk)}  wug_pollers={len(state.wug_pool.keys())}  "
-        f"ws_tokens={len(sub_tokens)}"
+        f"ws_tokens={len(sub_tokens)}  ws_fresh={ws_fresh}"
     )
 
 
@@ -570,20 +579,28 @@ async def _resolver_loop(state: "DaemonState", interval_s: float = 1800.0) -> No
             pass
 
 
-async def _no_side_sweep_loop(state: "DaemonState", interval_s: float = 10.0) -> None:
+async def _no_side_sweep_loop(state: "DaemonState", interval_s: float = 5.0) -> None:
     """Fast NO-side sweep — the 'fire faster' path.
 
     The WUG poller only re-evaluates a station when its extreme moves
     (≤60s, and throttle-bound). Between ticks, a fillable NO offer can
     appear and we'd miss it until the next tick. This loop re-runs
     Layer 7 + high-bucket-NO + persistence-tail for every active
-    (station,target,date) every ~10s, depth-walking SYNCHRONOUSLY from
-    the WS BookCache ladder (no REST). Strategy dedupe / progressive-eval
-    / trigger-time gates make re-runs cheap no-ops; the win is catching a
-    fillable offer within ~10s instead of ~60s — e.g. grabbing a Layer 7
-    dead-bucket reprice before it climbs to the $0.99 cap.
+    (station,target,date) every ~`interval_s`s, depth-walking
+    SYNCHRONOUSLY from the WS BookCache ladder (no REST). Strategy dedupe
+    / progressive-eval / trigger-time gates make re-runs cheap no-ops;
+    the win is catching a fillable offer within seconds instead of ~60s
+    — e.g. grabbing a Layer 7 dead-bucket reprice before it climbs to
+    the $0.99 cap.
+
+    Cadence note: 5s on a 1-vCPU VPS (the arb playbook runs ~2s, but its
+    per-iteration cost is lighter than our 3-strategy × depth-walk ×
+    dedupe scans). Drop lower only after confirming steady-state CPU.
     """
+    sweep_n = 0
     while not state.shutdown_event.is_set():
+        sweep_n += 1
+        depth_hits = depth_misses = 0  # WS-ladder availability this sweep
         try:
             for sk, ev in list(state.events_by_sk.items()):
                 station = state.stations_by_sk.get(sk)
@@ -599,6 +616,9 @@ async def _no_side_sweep_loop(state: "DaemonState", interval_s: float = 10.0) ->
                             d = state.book_cache.get_depth(tok, max_age_seconds=30.0)
                             if d is not None:
                                 depth_map[tok] = d
+                                depth_hits += 1
+                            else:
+                                depth_misses += 1
                 extreme = state.latest_extreme.get(sk)
                 # persistence-tail doesn't need the extreme (uses prior).
                 try:
@@ -643,6 +663,14 @@ async def _no_side_sweep_loop(state: "DaemonState", interval_s: float = 10.0) ->
         except Exception as exc:
             print(f"[sweep] loop failed: {type(exc).__name__}: {exc}",
                   file=sys.stderr)
+        # Periodically report WS-ladder availability so we can see whether
+        # get_depth is actually feeding the sweep (vs falling back to
+        # top-of-book everywhere → cold-start REST seed needed).
+        if sweep_n % 24 == 0:
+            tot = depth_hits + depth_misses
+            pct = (100.0 * depth_hits / tot) if tot else 0.0
+            print(f"[sweep] n={sweep_n} ws-depth hits={depth_hits} "
+                  f"misses={depth_misses} ({pct:.0f}% fresh)")
         try:
             await asyncio.wait_for(state.shutdown_event.wait(), timeout=interval_s)
         except asyncio.TimeoutError:
