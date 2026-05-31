@@ -1026,10 +1026,14 @@ def detect_and_execute_guaranteed_buys(
     # are no newly-dead buckets up to the current observed extreme.
     try:
         observed_int = _round_obs(observed_extreme_c, station.unit)
-        portfolio.set_last_evaluated_max(
+        changed = portfolio.set_last_evaluated_max(
             station_id, target, target_date_iso, int(observed_int),
         )
-        portfolio.save(portfolio_path)
+        # Only persist when the tracker actually advanced — avoids ~10
+        # redundant fcntl-locked saves/sec from the 10s NO-side sweep
+        # (fills already save immediately via the orphan guard above).
+        if changed:
+            portfolio.save(portfolio_path)
     except Exception:
         # Never fail the function over tracker bookkeeping.
         pass

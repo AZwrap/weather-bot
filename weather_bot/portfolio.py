@@ -740,19 +740,26 @@ class Portfolio:
 
     def set_last_evaluated_max(
         self, station_id: str, target: str, target_date_iso: str, value: int,
-    ) -> None:
+    ) -> bool:
         """Advance the tracker. Monotone: for max-target only writes if
         value > existing; for min-target only writes if value < existing.
+
+        Returns True iff the stored value actually changed — lets callers
+        skip a redundant portfolio.save() when nothing moved (matters for
+        the 10s NO-side sweep, which would otherwise save ~10×/sec).
         """
         key = self._sk_key(station_id, target, target_date_iso)
         cur = self.last_evaluated_max_by_sk.get(key)
         if cur is None:
             self.last_evaluated_max_by_sk[key] = int(value)
-            return
+            return True
         if target == "max" and int(value) > cur:
             self.last_evaluated_max_by_sk[key] = int(value)
-        elif target == "min" and int(value) < cur:
+            return True
+        if target == "min" and int(value) < cur:
             self.last_evaluated_max_by_sk[key] = int(value)
+            return True
+        return False
 
     def _last_cancel_for(self, token_id: str, side: Side) -> Position | None:
         """Most-recent cancelled record for (token, side), or None."""

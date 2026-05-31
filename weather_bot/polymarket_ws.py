@@ -244,9 +244,11 @@ class BookCache:
             # prior `book_invalidated` flag — a fresh full snapshot is
             # the source of truth, replacing whatever the delta stream
             # had previously made stale (audit finding C1).
-            bid = self._best_price(msg.get("bids", []), side="bid")
-            ask = self._best_price(msg.get("asks", []), side="ask")
-            self._update(asset_id, bid=bid, ask=ask)
+            bids = msg.get("bids", [])
+            asks = msg.get("asks", [])
+            bid = self._best_price(bids, side="bid")
+            ask = self._best_price(asks, side="ask")
+            self._update(asset_id, bid=bid, ask=ask, bids=bids, asks=asks)
         elif event_type == "price_change":
             # Delta arrival — we don't maintain full book state, so we
             # INVALIDATE the cached bid/ask. Callers asking for a fresh
@@ -313,6 +315,45 @@ class BookCache:
             return None
         return float(bid)
 
+    def get_depth(self, token_id: str, max_age_seconds: float = 30.0):
+        """Return an OrderBookDepth built from the cached ladder, or None
+        if the book is invalidated / stale / never seen. Lets the NO-side
+        sweep depth-walk SYNCHRONOUSLY from the WS stream — no REST call.
+
+        Returns None (not a partial) when invalidated by a price_change
+        delta, so the caller falls back to top-of-book rather than walking
+        a stale ladder.
+        """
+        from weather_bot.polymarket import OrderBookDepth, OrderBookLevel
+        entry = self._cache.get(token_id, {})
+        if entry.get("book_invalidated"):
+            return None
+        ts = entry.get("updated_at_ts")
+        if ts is None or (time.time() - float(ts)) > max_age_seconds:
+            return None
+        raw_bids = entry.get("bids_raw")
+        raw_asks = entry.get("asks_raw")
+        if raw_bids is None and raw_asks is None:
+            return None
+
+        def _parse(levels):
+            out = []
+            for lv in levels or []:
+                try:
+                    p = float(lv.get("price", 0)); s = float(lv.get("size", 0))
+                    if p > 0 and s > 0:
+                        out.append(OrderBookLevel(price=p, size_shares=s))
+                except (TypeError, ValueError, AttributeError):
+                    continue
+            return out
+
+        bids = sorted(_parse(raw_bids), key=lambda lv: -lv.price)  # best first
+        asks = sorted(_parse(raw_asks), key=lambda lv: lv.price)
+        return OrderBookDepth(
+            token_id=token_id, bids=bids, asks=asks,
+            tick_size=0.01, min_order_size=5,
+        )
+
     def updated_at(self, token_id: str) -> Optional[str]:
         entry = self._cache.get(token_id, {})
         return entry.get("updated_at")
@@ -344,12 +385,20 @@ class BookCache:
         """Count of entries currently flagged book_invalidated."""
         return sum(1 for e in self._cache.values() if e.get("book_invalidated"))
 
-    def _update(self, asset_id: str, *, bid: Optional[float], ask: Optional[float]) -> None:
+    def _update(self, asset_id: str, *, bid: Optional[float], ask: Optional[float],
+                bids: Optional[list] = None, asks: Optional[list] = None) -> None:
         entry = self._cache.setdefault(asset_id, {})
         if bid is not None:
             entry["bid"] = bid
         if ask is not None:
             entry["ask"] = ask
+        # Retain the full ladder from the snapshot so consumers can do a
+        # synchronous depth-walk (no REST). Stored as raw {price,size}
+        # dicts; get_depth() parses them into an OrderBookDepth.
+        if bids is not None:
+            entry["bids_raw"] = bids
+        if asks is not None:
+            entry["asks_raw"] = asks
         # Store as float seconds (time.time) — robust to refactors that
         # would otherwise break datetime.fromisoformat parsing (audit M2).
         entry["updated_at_ts"] = time.time()

@@ -117,10 +117,14 @@ class DaemonState:
         # Cached prior-day actuals for persistence_tail. Refreshed on
         # each events refresh tick from data/forward_log.jsonl.
         self.yesterday_actuals: dict[tuple[str, str], float] = {}
+        # Latest WUG-observed extreme per (sk) — fed to the fast NO-side
+        # sweep so it can re-run Layer7/high-bucket-NO between WUG ticks.
+        self.latest_extreme: dict[tuple[str, str, str], float] = {}
         self.shutdown_event = asyncio.Event()
         self.ws_task: asyncio.Task | None = None
         self.wug_pool: WUGPollerPool | None = None
         self.resolver_task: asyncio.Task | None = None
+        self.no_side_sweep_task: asyncio.Task | None = None
 
 
 def build_client(live: bool):
@@ -167,6 +171,11 @@ async def on_wug_update(state: DaemonState, upd: WUGUpdate) -> None:
     station = state.stations_by_sk.get(sk)
     if station is None:
         return
+
+    # Remember the latest observed extreme so the fast NO-side sweep can
+    # re-fire Layer 7 / high-bucket-NO between WUG ticks (≤10s) instead
+    # of only on the ≤60s WUG poll.
+    state.latest_extreme[sk] = upd.observed_extreme_c
 
     print(
         f"[wug] {upd.station_id}/{upd.target} {upd.target_date_iso}  "
@@ -561,6 +570,85 @@ async def _resolver_loop(state: "DaemonState", interval_s: float = 1800.0) -> No
             pass
 
 
+async def _no_side_sweep_loop(state: "DaemonState", interval_s: float = 10.0) -> None:
+    """Fast NO-side sweep — the 'fire faster' path.
+
+    The WUG poller only re-evaluates a station when its extreme moves
+    (≤60s, and throttle-bound). Between ticks, a fillable NO offer can
+    appear and we'd miss it until the next tick. This loop re-runs
+    Layer 7 + high-bucket-NO + persistence-tail for every active
+    (station,target,date) every ~10s, depth-walking SYNCHRONOUSLY from
+    the WS BookCache ladder (no REST). Strategy dedupe / progressive-eval
+    / trigger-time gates make re-runs cheap no-ops; the win is catching a
+    fillable offer within ~10s instead of ~60s — e.g. grabbing a Layer 7
+    dead-bucket reprice before it climbs to the $0.99 cap.
+    """
+    while not state.shutdown_event.is_set():
+        try:
+            for sk, ev in list(state.events_by_sk.items()):
+                station = state.stations_by_sk.get(sk)
+                if station is None:
+                    continue
+                sid, target, td_iso = sk
+                # Build a depth_map from the WS ladder for this event's
+                # tokens (None entries → strategy falls back to top-of-book).
+                depth_map = {}
+                for m in ev.markets:
+                    for tok in (m.no_token_id, m.yes_token_id):
+                        if tok:
+                            d = state.book_cache.get_depth(tok, max_age_seconds=30.0)
+                            if d is not None:
+                                depth_map[tok] = d
+                extreme = state.latest_extreme.get(sk)
+                # persistence-tail doesn't need the extreme (uses prior).
+                try:
+                    detect_and_execute_persistence_tail(
+                        station_id=sid, target_date_iso=td_iso, target=target,
+                        bucket_snapshots=list(ev.markets), client=state.client,
+                        portfolio=state.portfolio,
+                        portfolio_path=state.args.portfolio_path,
+                        yesterday_actuals=state.yesterday_actuals,
+                        depth_map=depth_map, verbose=False,
+                    )
+                except Exception as exc:
+                    print(f"[sweep] pers-tail {sid}: {exc}", file=sys.stderr)
+                if extreme is None:
+                    continue  # Layer7 + HBN need the observed extreme
+                try:
+                    detect_and_execute_guaranteed_buys(
+                        station_id=sid, target_date_iso=td_iso,
+                        observed_extreme_c=extreme, target=target,
+                        bucket_snapshots=list(ev.markets), client=state.client,
+                        portfolio=state.portfolio,
+                        portfolio_path=state.args.portfolio_path,
+                        book_cache=state.book_cache, depth_map=depth_map,
+                        verbose=False,
+                    )
+                except Exception as exc:
+                    print(f"[sweep] layer7 {sid}: {exc}", file=sys.stderr)
+                try:
+                    detect_and_execute_high_bucket_no(
+                        station_id=sid, target_date_iso=td_iso,
+                        observed_extreme_c=extreme, target=target,
+                        bucket_snapshots=list(ev.markets), client=state.client,
+                        portfolio=state.portfolio,
+                        portfolio_path=state.args.portfolio_path,
+                        book_cache=state.book_cache, depth_map=depth_map,
+                        verbose=False,
+                    )
+                except Exception as exc:
+                    print(f"[sweep] hbn {sid}: {exc}", file=sys.stderr)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(f"[sweep] loop failed: {type(exc).__name__}: {exc}",
+                  file=sys.stderr)
+        try:
+            await asyncio.wait_for(state.shutdown_event.wait(), timeout=interval_s)
+        except asyncio.TimeoutError:
+            pass
+
+
 def _maybe_fire_consensus_yes_exit(state: "DaemonState", msg: dict) -> None:
     """Fire the trailing-stop exit check on a single book message.
 
@@ -708,6 +796,11 @@ async def main_async() -> int:
         state.resolver_task = asyncio.create_task(
             _resolver_loop(state), name="daily-resolver",
         )
+        # Fast NO-side sweep (~10s) — re-fires Layer7/HBN/persistence
+        # between WUG ticks using WS-cached depth. The "fire faster" path.
+        state.no_side_sweep_task = asyncio.create_task(
+            _no_side_sweep_loop(state), name="no-side-sweep",
+        )
 
         # Main loop: periodic refresh + kill-switch + signal poll
         last_refresh = datetime.now(timezone.utc)
@@ -746,6 +839,12 @@ async def main_async() -> int:
                 state.resolver_task.cancel()
                 try:
                     await asyncio.wait_for(state.resolver_task, timeout=5.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    pass
+            if state.no_side_sweep_task is not None and not state.no_side_sweep_task.done():
+                state.no_side_sweep_task.cancel()
+                try:
+                    await asyncio.wait_for(state.no_side_sweep_task, timeout=5.0)
                 except (asyncio.CancelledError, asyncio.TimeoutError):
                     pass
             try:
