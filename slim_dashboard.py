@@ -28,18 +28,17 @@ from pathlib import Path
 from weather_bot.fees import taker_fee_usd
 from weather_bot.locations import STATIONS_BY_ID
 from weather_bot.pnl import _rounded_observation, bucket_won
+from weather_bot.units import c_to_f
 
 DATA = Path("data")
 HOST = "127.0.0.1"
 PORT = 8501
 REFRESH_S = 20  # client auto-refresh cadence
 
-# Live strategies (the only ones that still fire). Each maps to its fill log
-# and the side it bets. consensus_basket carries an explicit per-leg side.
 STRATEGIES = {
-    "consensus_basket": {"log": "consensus_basket_log.jsonl", "side": None,  "label": "Consensus basket"},
-    "high_bucket_no":   {"log": "high_bucket_no_log.jsonl",   "side": "NO",  "label": "High-bucket NO"},
-    "persistence_tail": {"log": "persistence_tail_log.jsonl", "side": "NO",  "label": "Persistence tail"},
+    "consensus_basket": {"log": "consensus_basket_log.jsonl", "side": None, "label": "Consensus basket"},
+    "high_bucket_no":   {"log": "high_bucket_no_log.jsonl",   "side": "NO", "label": "High-bucket NO"},
+    "persistence_tail": {"log": "persistence_tail_log.jsonl", "side": "NO", "label": "Persistence tail"},
 }
 
 
@@ -80,7 +79,7 @@ def _unit(sid: str) -> str:
 
 # ─────────────────────────────────────────── caches (slow calls)
 
-_cache: dict = {"sys": (0.0, None), "journal": (0.0, None)}
+_cache: dict = {}
 
 
 def _cached(key: str, ttl: float, fn):
@@ -126,7 +125,6 @@ def journal_tail(service: str, n: int = 250) -> list[str]:
 
 
 def read_flags() -> dict:
-    """Parse strategy enable flags from source (no heavy import)."""
     flags = {"paper_only": True}
     try:
         src = Path("slim_daemon.py").read_text(encoding="utf-8")
@@ -151,7 +149,6 @@ def read_flags() -> dict:
 # ─────────────────────────────────────────── P&L engine
 
 def resolution_map() -> dict:
-    """(station, target, date) → actual_obs_c, from forward_log."""
     out: dict = {}
     for r in load_jsonl(DATA / "forward_log.jsonl"):
         if r.get("actual_obs_c") is None:
@@ -163,7 +160,6 @@ def resolution_map() -> dict:
 
 
 def _score(sid, target, date, kind, thr, side, shares, fill, resmap):
-    """Net-of-fee P&L for one filled leg. status open|resolved."""
     cost = float(shares) * float(fill)
     fee = taker_fee_usd(float(shares), float(fill))
     actual_c = resmap.get((sid, target, date))
@@ -178,11 +174,10 @@ def _score(sid, target, date, kind, thr, side, shares, fill, resmap):
     side_won = bwon if side == "YES" else (not bwon)
     payout = float(shares) if side_won else 0.0
     return {"status": "resolved", "net": payout - cost - fee, "cost": cost,
-            "fee": fee, "won": side_won, "actual_int": actual_int}
+            "fee": fee, "won": side_won}
 
 
 def compute_positions(resmap) -> list[dict]:
-    """One row per filled leg across the 3 live strategies (deduped)."""
     rows: list[dict] = []
     seen = set()
     for strat, cfg in STRATEGIES.items():
@@ -211,63 +206,75 @@ def compute_positions(resmap) -> list[dict]:
     return rows
 
 
+def _agg(rows: list[dict], today: str) -> dict:
+    net = open_exp = today_net = 0.0
+    n_open = n_res = wins = losses = 0
+    byday: dict = defaultdict(float)
+    for p in rows:
+        if p["status"] == "resolved":
+            net += p["net"]; n_res += 1; byday[p["date"]] += p["net"]
+            if p["date"] == today:
+                today_net += p["net"]
+            if p["won"]:
+                wins += 1
+            else:
+                losses += 1
+        else:
+            n_open += 1; open_exp += p["cost"]
+    days = sorted(byday.items())[-14:]
+    return {
+        "total_net": round(net, 2), "today_net": round(today_net, 2),
+        "open_exposure": round(open_exp, 2),
+        "n_open": n_open, "n_resolved": n_res, "wins": wins, "losses": losses,
+        "win_rate": round(wins / n_res, 3) if n_res else None,
+        "by_day": [{"date": d, "net": round(v, 2)} for d, v in days],
+    }
+
+
 def compute(resmap=None) -> dict:
     resmap = resmap if resmap is not None else resolution_map()
     positions = compute_positions(resmap)
     today = datetime.now(timezone.utc).date().isoformat()
 
-    by_strat: dict = {}
-    by_day: dict = defaultdict(float)
-    tot_net = 0.0; tot_open_exp = 0.0; n_open = 0; n_res = 0; wins = 0; losses = 0; today_net = 0.0
-    for p in positions:
-        s = by_strat.setdefault(p["strategy"], {
-            "strategy": p["strategy"], "label": STRATEGIES.get(p["strategy"], {}).get("label", p["strategy"]),
-            "net": 0.0, "resolved": 0, "wins": 0, "open": 0, "open_exposure": 0.0})
-        if p["status"] == "resolved":
-            s["net"] += p["net"]; s["resolved"] += 1
-            tot_net += p["net"]; n_res += 1
-            by_day[p["date"]] += p["net"]
-            if p["date"] == today:
-                today_net += p["net"]
-            if p["won"]:
-                s["wins"] += 1; wins += 1
-            else:
-                losses += 1
-        else:
-            s["open"] += 1; s["open_exposure"] += p["cost"]
-            n_open += 1; tot_open_exp += p["cost"]
-    for s in by_strat.values():
-        s["net"] = round(s["net"], 2)
-        s["open_exposure"] = round(s["open_exposure"], 2)
-        s["win_rate"] = round(s["wins"] / s["resolved"], 3) if s["resolved"] else None
+    all_agg = _agg(positions, today)
+    by_strategy = {}
+    for strat in STRATEGIES:
+        a = _agg([p for p in positions if p["strategy"] == strat], today)
+        a["label"] = STRATEGIES[strat]["label"]
+        by_strategy[strat] = a
 
-    days = sorted(by_day.items())[-14:]
-
-    # activity feed (recent fills, any field set)
     activity = [{
         "ts": p["ts"], "strategy": p["strategy"], "station": p["station"],
         "target": p["target"], "date": p["date"], "bucket": p["bucket"],
         "side": p["side"], "shares": p["shares"], "fill": p["fill"],
         "status": p["status"], "net": p["net"],
-    } for p in positions[:60]]
+    } for p in positions[:80]]
 
     resolutions = []
     for r in load_jsonl(DATA / "forward_log.jsonl"):
         if r.get("actual_obs_c") is None:
             continue
+        actual_c = float(r["actual_obs_c"])
+        unit = _unit(r.get("station_id"))
+        native = round(c_to_f(actual_c), 1) if unit == "F" else round(actual_c, 1)
         resolutions.append({
             "station": r.get("station_id"), "target": r.get("target"),
-            "date": r.get("target_date"), "actual_c": round(float(r["actual_obs_c"]), 2),
+            "date": r.get("target_date"), "actual_c": round(actual_c, 1),
+            "actual_native": native, "unit": unit,
             "resolved_at": r.get("resolved_at_utc"), "source": r.get("source"),
         })
     resolutions.sort(key=lambda x: x.get("resolved_at") or "", reverse=True)
 
-    # health
     sysd = systemd_show("slim-daemon")
     fee_cfg = load_json(DATA / "fee_config_cache.json") or {}
-    excl = load_json(DATA / "excluded_stations.json") or {}
+    excl_raw = load_json(DATA / "excluded_stations.json") or []
+    excluded = []
+    if isinstance(excl_raw, list):
+        for r in excl_raw:
+            tag = (r.get("reason") or "").split("(")[0].strip()
+            excluded.append({"station": r.get("station_id"), "reason": tag[:64]})
     flags = read_flags()
-    # freshness: newest mtime among the live logs + forward_log
+
     newest = 0.0
     for cfg in STRATEGIES.values():
         p = DATA / cfg["log"]
@@ -287,31 +294,22 @@ def compute(resmap=None) -> dict:
         "daemon_restarts": sysd.get("NRestarts", "?"),
         "data_age_s": data_age,
         "flags": flags,
-        "live_strategies": [v["label"] for v in STRATEGIES.values()],
         "taker_fee_rate": fee_cfg.get("taker_fee_rate"),
-        "n_excluded": len(excl) if isinstance(excl, (list, dict)) else 0,
+        "n_excluded": len(excluded),
+        "excluded": excluded,
     }
 
     return {
         "generated_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "refresh_s": REFRESH_S,
         "health": health,
-        "pnl": {
-            "total_net": round(tot_net, 2),
-            "today_net": round(today_net, 2),
-            "open_exposure": round(tot_open_exp, 2),
-            "n_open": n_open, "n_resolved": n_res,
-            "wins": wins, "losses": losses,
-            "win_rate": round(wins / n_res, 3) if n_res else None,
-            "by_strategy": sorted(by_strat.values(), key=lambda s: -s["net"]),
-            "by_day": [{"date": d, "net": round(v, 2)} for d, v in days],
-        },
+        "pnl": {"all": all_agg, "by_strategy": by_strategy, "order": list(STRATEGIES.keys())},
         "positions": {
-            "open": [p for p in positions if p["status"] == "open"][:300],
-            "resolved": [p for p in positions if p["status"] == "resolved"][:300],
+            "open": [p for p in positions if p["status"] == "open"][:500],
+            "resolved": [p for p in positions if p["status"] == "resolved"][:500],
         },
         "activity": activity,
-        "resolutions": resolutions[:120],
+        "resolutions": resolutions[:200],
         "journal": journal_tail("slim-daemon", 250),
     }
 
@@ -325,13 +323,12 @@ PAGE = r"""<!DOCTYPE html>
 <style>
 :root{
   --bg:#0b0e14; --panel:#141a24; --panel2:#1b2230; --line:#222c3a;
-  --txt:#e6edf3; --mut:#8b98a9; --accent:#4aa8ff; --accent2:#2b3445;
+  --txt:#e6edf3; --mut:#8b98a9; --accent:#4aa8ff;
   --pos:#3fb950; --neg:#f85149; --warn:#d29922;
 }
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--txt);
   font:14px/1.45 "Segoe UI",system-ui,-apple-system,sans-serif}
-.mono{font-family:"SF Mono","Consolas",ui-monospace,monospace}
 header{display:flex;align-items:center;gap:14px;padding:14px 22px;
   background:linear-gradient(90deg,#11161f,#0b0e14);border-bottom:1px solid var(--line);
   position:sticky;top:0;z-index:5}
@@ -341,7 +338,6 @@ header .dot{width:9px;height:9px;border-radius:50%;display:inline-block}
 .badge{font-size:11px;padding:3px 9px;border-radius:20px;border:1px solid var(--line);
   background:var(--panel);color:var(--mut)}
 .badge.on{color:var(--pos);border-color:#1d3a25}
-.badge.off{color:var(--mut)}
 .badge.paper{color:var(--accent);border-color:#1d3550}
 .badge.bad{color:var(--neg);border-color:#3a1d1d}
 .updated{font-size:11px;color:var(--mut)}
@@ -351,7 +347,11 @@ nav button{background:none;border:none;color:var(--mut);padding:9px 16px;cursor:
   font-size:13px;border-bottom:2px solid transparent;border-radius:6px 6px 0 0}
 nav button:hover{color:var(--txt);background:var(--panel)}
 nav button.active{color:var(--txt);border-bottom-color:var(--accent);font-weight:600}
-main{padding:20px 22px 60px;max-width:1500px}
+main{padding:18px 22px 60px;max-width:1560px}
+.filterbar{display:flex;align-items:center;gap:10px;margin-bottom:16px;color:var(--mut);font-size:13px}
+.filterbar select{background:var(--panel);color:var(--txt);border:1px solid var(--line);
+  border-radius:8px;padding:7px 12px;font-size:13px;cursor:pointer;outline:none}
+.filterbar select:hover{border-color:var(--accent)}
 .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px;margin-bottom:22px}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px 18px}
 .card .k{font-size:12px;color:var(--mut);text-transform:uppercase;letter-spacing:.5px}
@@ -359,35 +359,40 @@ main{padding:20px 22px 60px;max-width:1500px}
 .card .sub{font-size:12px;color:var(--mut);margin-top:4px}
 .pos{color:var(--pos)} .neg{color:var(--neg)} .mut{color:var(--mut)} .warn{color:var(--warn)}
 .section{background:var(--panel);border:1px solid var(--line);border-radius:12px;
-  padding:6px 0 0;margin-bottom:22px;overflow:hidden}
-.section h2{font-size:13px;margin:0;padding:14px 18px 10px;color:var(--mut);
+  margin-bottom:18px;overflow:hidden}
+.section h2{font-size:13px;margin:0;padding:13px 18px;color:var(--mut);
   text-transform:uppercase;letter-spacing:.5px;font-weight:600}
+.section h2.fold{cursor:pointer;user-select:none;display:flex;align-items:center;gap:9px}
+.section h2.fold:hover{color:var(--txt);background:var(--panel2)}
+.caret{display:inline-block;width:12px;color:var(--accent)}
 table{width:100%;border-collapse:collapse;font-size:13px}
 th{text-align:left;color:var(--mut);font-weight:600;font-size:11px;text-transform:uppercase;
-  letter-spacing:.4px;padding:8px 14px;border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--panel)}
+  letter-spacing:.4px;padding:8px 14px;border-bottom:1px solid var(--line);
+  position:sticky;top:0;background:var(--panel);white-space:nowrap}
+th.sortable{cursor:pointer;user-select:none}
+th.sortable:hover{color:var(--txt)}
+th .sarr{color:#3a4658;font-size:10px;margin-left:3px}
 td{padding:8px 14px;border-bottom:1px solid #1a212c}
 tr:hover td{background:var(--panel2)}
 td.num,th.num{text-align:right;font-family:ui-monospace,monospace}
-.pill{font-size:11px;padding:2px 8px;border-radius:10px;background:var(--accent2);color:var(--txt)}
+.pill{font-size:11px;padding:2px 8px;border-radius:10px}
 .pill.no{background:#2a2030;color:#e6a8d0} .pill.yes{background:#1d3550;color:#9fd0ff}
 .tag{font-size:11px;color:var(--mut)}
-.bars{display:flex;align-items:flex-end;gap:5px;height:70px;padding:6px 18px 14px}
+.bars{display:flex;align-items:flex-end;gap:5px;height:78px;padding:8px 18px 18px}
 .bars .b{flex:1;min-width:6px;border-radius:3px 3px 0 0;position:relative}
 .bars .b span{position:absolute;bottom:-15px;left:50%;transform:translateX(-50%);
   font-size:9px;color:var(--mut);white-space:nowrap}
-.scroll{max-height:520px;overflow:auto}
+.scroll{max-height:560px;overflow:auto}
 pre.log{margin:0;padding:14px 18px;font-size:12px;line-height:1.5;color:#b9c4d0;
-  max-height:600px;overflow:auto;white-space:pre-wrap;word-break:break-word}
+  max-height:620px;overflow:auto;white-space:pre-wrap;word-break:break-word}
 .hidden{display:none}
-.empty{padding:26px 18px;color:var(--mut);text-align:center}
-.flex{display:flex;gap:22px;flex-wrap:wrap}.flex>.section{flex:1;min-width:340px}
-.right{margin-left:auto}
+.empty{padding:24px 18px;color:var(--mut);text-align:center}
 a.refresh{color:var(--accent);cursor:pointer;font-size:12px;text-decoration:none}
 </style></head>
 <body>
 <header>
   <span id="hdot" class="dot"></span>
-  <h1>Weather Bot <span class="tag mono" id="mode"></span></h1>
+  <h1>Weather Bot</h1>
   <div class="badges" id="badges"></div>
 </header>
 <nav id="nav"></nav>
@@ -400,172 +405,251 @@ a.refresh{color:var(--accent);cursor:pointer;font-size:12px;text-decoration:none
 </main>
 <script>
 const TABS = ["Overview","Positions & P&L","Strategies","Resolutions","System"];
-let TAB = 0, D = null;
-const $ = (h)=>{const t=document.createElement('template');t.innerHTML=h.trim();return t.content.firstChild;};
-const money=(v)=> v==null?'—':(v>=0?'+':'')+'$'+v.toFixed(2);
-const cls=(v)=> v==null?'mut':(v>0?'pos':(v<0?'neg':'mut'));
-const pct=(v)=> v==null?'—':(v*100).toFixed(0)+'%';
-const esc=(s)=> (s==null?'':String(s)).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
-const ago=(s)=> s==null?'—':(s<90?s+'s':(s<5400?Math.round(s/60)+'m':Math.round(s/3600)+'h'))+' ago';
+const STRATS=[["all","All"],["consensus_basket","Basket"],["high_bucket_no","Hi-NO"],["persistence_tail","Tail"]];
+let TAB=0, D=null, FILTER="all";
+const SORTS={}, FOLDS={};
 
-function badges(h){
-  const f=h.flags||{};
-  const b=[];
-  b.push(`<span class="badge ${h.paper_only?'paper':'bad'}">${h.paper_only?'PAPER-ONLY':'LIVE ⚠'}</span>`);
-  if(h.kill_switch) b.push(`<span class="badge bad">KILL_SWITCH</span>`);
-  const da=(h.daemon_active==='active');
-  b.push(`<span class="badge ${da?'on':'bad'}">daemon ${esc(h.daemon_active)}</span>`);
-  for(const [k,label] of [['consensus_basket','basket'],['high_bucket_no','hi-NO'],['persistence_tail','tail']])
-    b.push(`<span class="badge on">${label}</span>`);
-  for(const k of ['layer7','v2','consensus_yes','consistency_arb'])
-    b.push(`<span class="badge off">${k} off</span>`);
-  return b.join('');
+const money=(v)=> v==null?"—":(v>=0?"+":"")+"$"+(+v).toFixed(2);
+const cls=(v)=> v==null?"mut":(v>0?"pos":(v<0?"neg":"mut"));
+const pct=(v)=> v==null?"—":(v*100).toFixed(0)+"%";
+const esc=(s)=> (s==null?"":String(s)).replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+const ago=(s)=> s==null?"—":((s<90?s+"s":(s<5400?Math.round(s/60)+"m":Math.round(s/3600)+"h"))+" ago");
+const sshort=(s)=> ({consensus_basket:"basket",high_bucket_no:"hi-NO",persistence_tail:"tail"}[s]||s);
+const sidePill=(s)=> `<span class="pill ${s==="NO"?"no":"yes"}">${s}</span>`;
+const tmin=(t)=> esc((t||"").slice(5,16).replace("T"," "));
+const cur=()=> FILTER==="all"? D.pnl.all : D.pnl.by_strategy[FILTER];
+const fp=(arr)=> FILTER==="all"?arr:arr.filter(x=>x.strategy===FILTER);
+
+function setFilter(v){FILTER=v;render();}
+function filterBar(){
+  return `<div class="filterbar">Strategy
+    <select onchange="setFilter(this.value)">`+
+    STRATS.map(([v,l])=>`<option value="${v}" ${FILTER===v?"selected":""}>${l}</option>`).join("")+
+    `</select></div>`;
+}
+function toggleFold(id){FOLDS[id]=(FOLDS[id]===false);render();}
+function fold(id,title,body){
+  const open=FOLDS[id]!==false;
+  return `<div class="section"><h2 class="fold" onclick="toggleFold('${id}')">
+      <span class="caret">${open?"▾":"▸"}</span>${title}</h2>
+      <div class="${open?"":"hidden"}">${body}</div></div>`;
+}
+function sortBy(tid,col){
+  const s=SORTS[tid];
+  if(s&&s.col===col) s.dir=(s.dir==="asc"?"desc":"asc");
+  else SORTS[tid]={col,dir:"desc"};
+  render();
+}
+// cols: [{t, key, num, html(row), cls(row)}]
+function table(tid, cols, rows){
+  if(!rows||!rows.length) return `<div class="empty">Nothing here.</div>`;
+  const s=SORTS[tid];
+  let rs=rows.slice();
+  if(s){
+    const c=cols[s.col], k=c.key;
+    rs.sort((a,b)=>{
+      let va=a[k], vb=b[k];
+      if(va==null&&vb==null) return 0;
+      if(va==null) return 1;
+      if(vb==null) return -1;
+      if(c.num){va=+va;vb=+vb;} else {va=(""+va).toLowerCase();vb=(""+vb).toLowerCase();}
+      const r=va<vb?-1:(va>vb?1:0);
+      return s.dir==="asc"?r:-r;
+    });
+  }
+  let h=`<div class="scroll"><table><thead><tr>`;
+  cols.forEach((c,i)=>{
+    const arr=(s&&s.col===i)?(s.dir==="asc"?" ▲":" ▼"):`<span class="sarr">⇅</span>`;
+    h+=`<th class="${c.num?"num ":""}sortable" onclick="sortBy('${tid}',${i})">${c.t}${arr}</th>`;
+  });
+  h+=`</tr></thead><tbody>`;
+  for(const r of rs){
+    h+="<tr>";
+    for(const c of cols){
+      const cc=(c.num?"num ":"")+(c.cls?c.cls(r):"");
+      h+=`<td class="${cc.trim()}">${c.html?c.html(r):esc(r[c.key])}</td>`;
+    }
+    h+="</tr>";
+  }
+  return h+`</tbody></table></div>`;
 }
 
+const C={
+  eventCell:(r)=>`${esc(r.station)} <span class="tag">${esc(r.target)} ${esc(r.date)}</span>`,
+};
+
+function badges(h){
+  const b=[];
+  b.push(`<span class="badge ${h.paper_only?"paper":"bad"}">${h.paper_only?"PAPER-ONLY":"LIVE ⚠"}</span>`);
+  if(h.kill_switch) b.push(`<span class="badge bad">KILL_SWITCH</span>`);
+  b.push(`<span class="badge ${h.daemon_active==="active"?"on":"bad"}">daemon ${esc(h.daemon_active)}</span>`);
+  b.push(`<span class="badge on">basket · hi-NO · tail</span>`);
+  return b.join("");
+}
 function navbar(){
-  const n=document.getElementById('nav'); n.innerHTML='';
-  TABS.forEach((t,i)=>{const btn=$(`<button class="${i===TAB?'active':''}">${t}</button>`);
+  const n=document.getElementById("nav"); n.innerHTML="";
+  TABS.forEach((t,i)=>{const btn=document.createElement("button");
+    btn.textContent=t; if(i===TAB)btn.className="active";
     btn.onclick=()=>{TAB=i;render();}; n.appendChild(btn);});
 }
 
-function tbl(cols, rows, render){
-  if(!rows||!rows.length) return `<div class="empty">Nothing yet.</div>`;
-  let h='<div class="scroll"><table><thead><tr>'+cols.map(c=>`<th class="${c.n?'num':''}">${c.t}</th>`).join('')+'</tr></thead><tbody>';
-  h+=rows.map(r=>'<tr>'+render(r)+'</tr>').join('');
-  return h+'</tbody></table></div>';
-}
-
-function sidePill(s){return `<span class="pill ${s==='NO'?'no':'yes'}">${s}</span>`;}
-
-function overview(){
-  const p=D.pnl, h=D.health;
-  let html=`<div class="cards">
+function cards(a){
+  const h=D.health;
+  return `<div class="cards">
     <div class="card"><div class="k">Realized P&L (net of fee)</div>
-      <div class="v ${cls(p.total_net)}">${money(p.total_net)}</div>
-      <div class="sub">${p.n_resolved} resolved · win ${pct(p.win_rate)}</div></div>
+      <div class="v ${cls(a.total_net)}">${money(a.total_net)}</div>
+      <div class="sub">${a.n_resolved} resolved · win ${pct(a.win_rate)}</div></div>
     <div class="card"><div class="k">Today</div>
-      <div class="v ${cls(p.today_net)}">${money(p.today_net)}</div>
+      <div class="v ${cls(a.today_net)}">${money(a.today_net)}</div>
       <div class="sub">UTC ${esc(D.generated_utc.slice(0,10))}</div></div>
     <div class="card"><div class="k">Open exposure</div>
-      <div class="v">$${p.open_exposure.toFixed(2)}</div>
-      <div class="sub">${p.n_open} open positions</div></div>
+      <div class="v">$${a.open_exposure.toFixed(2)}</div>
+      <div class="sub">${a.n_open} open positions</div></div>
     <div class="card"><div class="k">Record</div>
-      <div class="v">${p.wins}<span class="mut" style="font-size:16px">/${p.wins+p.losses}</span></div>
-      <div class="sub">${p.losses} losses</div></div>
+      <div class="v">${a.wins}<span class="mut" style="font-size:16px">/${a.wins+a.losses}</span></div>
+      <div class="sub">${a.losses} losses</div></div>
     <div class="card"><div class="k">Data freshness</div>
-      <div class="v ${h.data_age_s!=null&&h.data_age_s<600?'pos':'warn'}" style="font-size:22px">${ago(h.data_age_s)}</div>
+      <div class="v ${h.data_age_s!=null&&h.data_age_s<600?"pos":"warn"}" style="font-size:22px">${ago(h.data_age_s)}</div>
       <div class="sub">daemon restarts: ${esc(h.daemon_restarts)}</div></div>
   </div>`;
+}
+function barsBody(a){
+  const days=a.by_day||[];
+  if(!days.length) return `<div class="empty">No resolved P&L yet.</div>`;
+  const mx=Math.max(1,...days.map(d=>Math.abs(d.net)));
+  return `<div class="bars">`+days.map(d=>{const hgt=Math.max(3,Math.abs(d.net)/mx*56);
+    return `<div class="b" title="${d.date}: ${money(d.net)}" style="height:${hgt}px;background:${d.net>=0?"var(--pos)":"var(--neg)"}"><span>${d.date.slice(5)}</span></div>`;}).join("")+`</div>`;
+}
 
-  // by-day bars
-  const days=p.by_day||[];
-  if(days.length){
-    const mx=Math.max(1,...days.map(d=>Math.abs(d.net)));
-    html+=`<div class="section"><h2>Realized P&L by event date (net of fee)</h2><div class="bars">`+
-      days.map(d=>{const hgt=Math.max(3,Math.abs(d.net)/mx*52);
-        return `<div class="b" title="${d.date}: ${money(d.net)}" style="height:${hgt}px;background:${d.net>=0?'var(--pos)':'var(--neg)'}"><span>${d.date.slice(5)}</span></div>`;}).join('')+
-      `</div></div>`;
-  }
+function overview(){
+  const a=cur();
+  let html=filterBar()+cards(a);
+  html+=fold("ov-bars","Realized P&L by event date (net of fee)", barsBody(a));
 
-  html+=`<div class="section"><h2>Per-strategy P&L</h2>`+tbl(
-    [{t:'Strategy'},{t:'Net',n:1},{t:'Resolved',n:1},{t:'Win rate',n:1},{t:'Open',n:1},{t:'Open $',n:1}],
-    p.by_strategy,
-    s=>`<td>${esc(s.label)}</td><td class="num ${cls(s.net)}">${money(s.net)}</td>
-        <td class="num">${s.resolved}</td><td class="num">${pct(s.win_rate)}</td>
-        <td class="num">${s.open}</td><td class="num">$${s.open_exposure.toFixed(2)}</td>`)+`</div>`;
+  let stratRows=D.pnl.order.map(s=>({strategy:s, ...D.pnl.by_strategy[s]}));
+  if(FILTER!=="all") stratRows=stratRows.filter(r=>r.strategy===FILTER);
+  html+=fold("ov-strat","Per-strategy P&L", table("ov-strat-t",[
+    {t:"Strategy",key:"label"},
+    {t:"Net",key:"total_net",num:1,html:r=>money(r.total_net),cls:r=>cls(r.total_net)},
+    {t:"Resolved",key:"n_resolved",num:1},
+    {t:"Win rate",key:"win_rate",num:1,html:r=>pct(r.win_rate)},
+    {t:"Open",key:"n_open",num:1},
+    {t:"Open $",key:"open_exposure",num:1,html:r=>"$"+r.open_exposure.toFixed(2)},
+  ],stratRows));
 
-  html+=`<div class="section"><h2>Recent activity</h2>`+tbl(
-    [{t:'Time'},{t:'Strategy'},{t:'Station'},{t:'Bucket'},{t:'Side'},{t:'Shares',n:1},{t:'Fill',n:1},{t:'Status'},{t:'Net',n:1}],
-    D.activity,
-    r=>`<td class="mono tag">${esc((r.ts||'').slice(5,19).replace('T',' '))}</td>
-        <td>${esc((r.strategy||'').replace('consensus_basket','basket').replace('high_bucket_no','hi-NO').replace('persistence_tail','tail'))}</td>
-        <td>${esc(r.station)} <span class="tag">${esc(r.target)}</span></td>
-        <td>${esc(r.bucket)}</td><td>${sidePill(r.side)}</td>
-        <td class="num">${r.shares}</td><td class="num">${r.fill}</td>
-        <td><span class="tag">${esc(r.status)}</span></td>
-        <td class="num ${cls(r.net)}">${r.net==null?'—':money(r.net)}</td>`)+`</div>`;
+  html+=fold("ov-act","Recent activity", table("ov-act-t",[
+    {t:"Time",key:"ts",html:r=>`<span class="tag mono">${tmin(r.ts)}</span>`},
+    {t:"Strategy",key:"strategy",html:r=>sshort(r.strategy)},
+    {t:"Station",key:"station",html:C.eventCell},
+    {t:"Bucket",key:"bucket"},
+    {t:"Side",key:"side",html:r=>sidePill(r.side)},
+    {t:"Shares",key:"shares",num:1},
+    {t:"Fill",key:"fill",num:1},
+    {t:"Status",key:"status",html:r=>`<span class="tag">${esc(r.status)}</span>`},
+    {t:"Net",key:"net",num:1,html:r=>r.net==null?"—":money(r.net),cls:r=>cls(r.net)},
+  ],fp(D.activity)));
   return html;
 }
 
+function posCols(resolved){
+  const c=[
+    {t:"Filled",key:"ts",html:r=>`<span class="tag mono">${tmin(r.ts)}</span>`},
+    {t:"Strat",key:"strategy",html:r=>sshort(r.strategy)},
+    {t:"Event",key:"date",html:C.eventCell},
+    {t:"Bucket",key:"bucket"},
+    {t:"Side",key:"side",html:r=>sidePill(r.side)},
+    {t:"Sh",key:"shares",num:1},
+    {t:"Fill",key:"fill",num:1},
+    {t:"Cost",key:"cost",num:1,html:r=>"$"+(r.cost||0).toFixed(2)},
+  ];
+  if(resolved){
+    c.push({t:"Result",key:"won",num:1,html:r=>r.won?`<span class="pos">WON</span>`:`<span class="neg">lost</span>`});
+    c.push({t:"Net",key:"net",num:1,html:r=>money(r.net),cls:r=>cls(r.net)});
+  }
+  return c;
+}
 function positionsTab(){
-  const o=D.positions.open, r=D.positions.resolved;
-  const row=(p,resolved)=>`<td class="mono tag">${esc((p.ts||'').slice(5,16).replace('T',' '))}</td>
-      <td>${esc(p.strategy.replace('consensus_basket','basket').replace('high_bucket_no','hi-NO').replace('persistence_tail','tail'))}</td>
-      <td>${esc(p.station)} <span class="tag">${esc(p.target)} ${esc(p.date)}</span></td>
-      <td>${esc(p.bucket)}</td><td>${sidePill(p.side)}</td>
-      <td class="num">${p.shares}</td><td class="num">${p.fill}</td>
-      <td class="num">$${p.cost.toFixed(2)}</td>`+
-      (resolved?`<td class="num">${p.won?'<span class="pos">WON</span>':'<span class="neg">lost</span>'}</td>
-      <td class="num ${cls(p.net)}">${money(p.net)}</td>`:'');
-  let html=`<div class="flex">
-    <div class="section"><h2>Open positions · ${o.length} · $${D.pnl.open_exposure.toFixed(2)} exposure</h2>`+
-    tbl([{t:'Filled'},{t:'Strat'},{t:'Event'},{t:'Bucket'},{t:'Side'},{t:'Sh',n:1},{t:'Fill',n:1},{t:'Cost',n:1}],o,p=>row(p,false))+`</div></div>`;
-  html+=`<div class="section"><h2>Resolved positions · ${r.length} · net ${money(D.pnl.total_net)}</h2>`+
-    tbl([{t:'Filled'},{t:'Strat'},{t:'Event'},{t:'Bucket'},{t:'Side'},{t:'Sh',n:1},{t:'Fill',n:1},{t:'Cost',n:1},{t:'Result',n:1},{t:'Net',n:1}],r,p=>row(p,true))+`</div>`;
+  const a=cur();
+  const open=fp(D.positions.open), res=fp(D.positions.resolved);
+  let html=filterBar();
+  html+=fold("pos-open",`Open positions · ${a.n_open} · $${a.open_exposure.toFixed(2)} exposure`,
+    table("pos-open-t",posCols(false),open));
+  html+=fold("pos-res",`Resolved positions · ${a.n_resolved} · net ${money(a.total_net)} · win ${pct(a.win_rate)}`,
+    table("pos-res-t",posCols(true),res));
   return html;
 }
 
 function strategiesTab(){
-  let html='';
-  for(const s of D.pnl.by_strategy){
-    const open=D.positions.open.filter(p=>p.strategy===s.strategy);
-    const res=D.positions.resolved.filter(p=>p.strategy===s.strategy).slice(0,40);
-    html+=`<div class="section"><h2>${esc(s.label)} — net ${money(s.net)} · win ${pct(s.win_rate)} · ${s.open} open ($${s.open_exposure.toFixed(2)})</h2>`+
-      tbl([{t:'Filled'},{t:'Event'},{t:'Bucket'},{t:'Side'},{t:'Fill',n:1},{t:'Status'},{t:'Net',n:1}],
-        [...open.slice(0,15),...res],
-        p=>`<td class="mono tag">${esc((p.ts||'').slice(5,16).replace('T',' '))}</td>
-            <td>${esc(p.station)} <span class="tag">${esc(p.target)} ${esc(p.date)}</span></td>
-            <td>${esc(p.bucket)}</td><td>${sidePill(p.side)}</td><td class="num">${p.fill}</td>
-            <td><span class="tag">${p.status}</span></td>
-            <td class="num ${cls(p.net)}">${p.net==null?'—':money(p.net)}</td>`)+`</div>`;
+  let html="";
+  for(const s of D.pnl.order){
+    const a=D.pnl.by_strategy[s];
+    const rows=[...D.positions.open.filter(p=>p.strategy===s),
+                ...D.positions.resolved.filter(p=>p.strategy===s)];
+    html+=fold("str-"+s,
+      `${esc(a.label)} — net <span class="${cls(a.total_net)}">${money(a.total_net)}</span> · win ${pct(a.win_rate)} · ${a.n_open} open ($${a.open_exposure.toFixed(2)})`,
+      table("str-"+s+"-t",[
+        {t:"Filled",key:"ts",html:r=>`<span class="tag mono">${tmin(r.ts)}</span>`},
+        {t:"Event",key:"date",html:C.eventCell},
+        {t:"Bucket",key:"bucket"},
+        {t:"Side",key:"side",html:r=>sidePill(r.side)},
+        {t:"Fill",key:"fill",num:1},
+        {t:"Status",key:"status",html:r=>`<span class="tag">${esc(r.status)}</span>`},
+        {t:"Net",key:"net",num:1,html:r=>r.net==null?"—":money(r.net),cls:r=>cls(r.net)},
+      ],rows));
   }
   return html||`<div class="empty">No strategy data.</div>`;
 }
 
 function resolutionsTab(){
-  return `<div class="section"><h2>Wunderground resolutions (truth source)</h2>`+tbl(
-    [{t:'Resolved at'},{t:'Station'},{t:'Target'},{t:'Date'},{t:'Actual °C',n:1},{t:'Source'}],
-    D.resolutions,
-    r=>`<td class="mono tag">${esc((r.resolved_at||'').slice(0,19).replace('T',' '))}</td>
-        <td>${esc(r.station)}</td><td>${esc(r.target)}</td><td>${esc(r.date)}</td>
-        <td class="num">${r.actual_c}</td><td class="tag">${esc(r.source)}</td>`)+`</div>`;
+  return fold("res-all","Wunderground resolutions (truth source · station native unit)",
+    table("res-t",[
+      {t:"Resolved at",key:"resolved_at",html:r=>`<span class="tag mono">${esc((r.resolved_at||"").slice(0,19).replace("T"," "))}</span>`},
+      {t:"Station",key:"station"},
+      {t:"Target",key:"target"},
+      {t:"Date",key:"date"},
+      {t:"Actual",key:"actual_native",num:1,html:r=>`${r.actual_native}°${r.unit}`},
+      {t:"Source",key:"source",html:r=>`<span class="tag">${esc(r.source)}</span>`},
+    ],D.resolutions));
 }
 
 function systemTab(){
   const h=D.health,f=h.flags||{};
   let html=`<div class="cards">
-    <div class="card"><div class="k">Mode</div><div class="v ${h.paper_only?'pos':'neg'}" style="font-size:20px">${h.paper_only?'PAPER-ONLY':'LIVE'}</div>
-      <div class="sub">kill switch: ${h.kill_switch?'<span class="neg">ON</span>':'off'}</div></div>
+    <div class="card"><div class="k">Mode</div><div class="v ${h.paper_only?"pos":"neg"}" style="font-size:20px">${h.paper_only?"PAPER-ONLY":"LIVE"}</div>
+      <div class="sub">kill switch: ${h.kill_switch?'<span class="neg">ON</span>':"off"}</div></div>
     <div class="card"><div class="k">Daemon</div><div class="v" style="font-size:20px">${esc(h.daemon_active)}/${esc(h.daemon_sub)}</div>
-      <div class="sub">since ${esc((h.daemon_since||'').slice(0,19))}</div></div>
-    <div class="card"><div class="k">Taker fee rate</div><div class="v" style="font-size:20px">${h.taker_fee_rate==null?'—':h.taker_fee_rate}</div>
-      <div class="sub">${h.n_excluded} excluded stations</div></div>
+      <div class="sub">since ${esc((h.daemon_since||"").slice(0,19))}</div></div>
+    <div class="card"><div class="k">Taker fee rate</div><div class="v" style="font-size:20px">${h.taker_fee_rate==null?"—":h.taker_fee_rate}</div>
+      <div class="sub">${h.n_excluded} excluded stations (below)</div></div>
     <div class="card"><div class="k">Strategy flags</div>
       <div class="sub" style="margin-top:8px;line-height:1.9">
         ${Object.entries({layer7:f.layer7,v2:f.v2,consensus_yes:f.consensus_yes,consistency_arb:f.consistency_arb})
-          .map(([k,v])=>`${k}: <span class="${v?'pos':'mut'}">${v?'ON':'off'}</span>`).join('<br>')}</div></div>
+          .map(([k,v])=>`${k}: <span class="${v?"pos":"mut"}">${v?"ON":"off"}</span>`).join("<br>")}</div></div>
   </div>`;
-  html+=`<div class="section"><h2>slim-daemon journal (last 250)</h2><pre class="log" id="log">`+
-    (D.journal||[]).map(esc).join('\n')+`</pre></div>`;
+  html+=fold("sys-excl","Excluded stations ("+(h.excluded||[]).length+")",
+    table("sys-excl-t",[
+      {t:"Station",key:"station"},
+      {t:"Reason",key:"reason"},
+    ],h.excluded||[]));
+  html+=fold("sys-journal","slim-daemon journal (last 250)",
+    `<pre class="log" id="log">`+(D.journal||[]).map(esc).join("\n")+`</pre>`);
   return html;
 }
 
 function render(){
   navbar();
-  document.getElementById('badges').innerHTML=badges(D.health);
-  document.getElementById('mode').textContent='';
-  document.getElementById('hdot').style.background = (D.health.daemon_active==='active' && D.health.paper_only)?'var(--pos)':'var(--neg)';
-  document.getElementById('updated').textContent=(D.generated_utc||'').replace('T',' ');
-  document.getElementById('rs').textContent=D.refresh_s;
-  const v=document.getElementById('view');
-  v.innerHTML=[overview,positionsTab,strategiesTab,resolutionsTab,systemTab][TAB]();
-  const lg=document.getElementById('log'); if(lg) lg.scrollTop=lg.scrollHeight;
+  document.getElementById("badges").innerHTML=badges(D.health);
+  document.getElementById("hdot").style.background=(D.health.daemon_active==="active"&&D.health.paper_only)?"var(--pos)":"var(--neg)";
+  document.getElementById("updated").textContent=(D.generated_utc||"").replace("T"," ");
+  document.getElementById("rs").textContent=D.refresh_s;
+  document.getElementById("view").innerHTML=[overview,positionsTab,strategiesTab,resolutionsTab,systemTab][TAB]();
+  const lg=document.getElementById("log"); if(lg) lg.scrollTop=lg.scrollHeight;
 }
 
 async function load(){
   try{
-    const r=await fetch('/api/data',{cache:'no-store'}); D=await r.json(); render();
-  }catch(e){ document.getElementById('view').innerHTML='<div class="empty">Failed to load /api/data: '+esc(e)+'</div>'; }
+    const r=await fetch("/api/data",{cache:"no-store"}); D=await r.json(); render();
+  }catch(e){ document.getElementById("view").innerHTML='<div class="empty">Failed to load /api/data: '+esc(e)+"</div>"; }
 }
 load(); setInterval(load, __REFRESH__*1000);
 </script>
@@ -596,13 +680,13 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(404, "not found", "text/plain")
         except BrokenPipeError:
             pass
-        except Exception as exc:  # never crash the server on one bad request
+        except Exception as exc:
             try:
                 self._send(500, json.dumps({"error": str(exc)}), "application/json")
             except Exception:
                 pass
 
-    def log_message(self, *a):  # quiet
+    def log_message(self, *a):
         return
 
 
