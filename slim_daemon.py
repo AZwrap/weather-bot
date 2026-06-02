@@ -543,10 +543,17 @@ async def refresh_events_and_pollers(state: DaemonState) -> None:
             client=state.client,
             portfolio=state.portfolio,
             portfolio_path=state.args.portfolio_path,
+            book_cache=state.book_cache,
         )
-        if counts and counts.get("placed", 0) > 0:
-            print(f"[cons-arb] opportunities={counts['placed']} "
-                  f"pairs_scanned={counts.get('pairs_scanned', 0)}")
+        rej = {k: v for k, v in (counts or {}).items() if k.startswith("rej_")}
+        if counts and (counts.get("placed", 0) > 0 or sum(rej.values()) > 0):
+            # Funnel: how many candidates cleared the cheap top-of-book
+            # pre-filter, then how many survived depth + fees + artifact.
+            cleared_tob = counts.get("placed", 0) + sum(rej.values())
+            print(f"[cons-arb] confirmed={counts.get('placed', 0)} "
+                  f"(net-of-fee, depth-checked)  "
+                  f"cleared_top_of_book={cleared_tob}  "
+                  f"rejected={rej}  pairs={counts.get('pairs_scanned', 0)}")
     except Exception as exc:
         print(f"[cons-arb] failed: {type(exc).__name__}: {exc}",
               file=sys.stderr)

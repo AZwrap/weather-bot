@@ -55,12 +55,52 @@ $0.02 mirrors the prior live_bucket_arb's MIN_ARB_MARGIN_USD_DEPTH.
 Above this we log; below this we don't bother (fees would eat it)."""
 
 DEFAULT_SIZE_USD: float = 5.0
-"""Per-arb USD notional. We size each LEG to produce $size_usd in
-total outlay. Shares per leg = size_usd / leg_price."""
+"""Legacy per-arb USD notional (kept for callers that pass it). The
+hardened path sizes by SHARES, not USD — see SHARES_PER_LEG."""
+
+SHARES_PER_LEG: int = 5
+"""Hardened arb unit. The arb pays $shares whichever bucket wins, so we
+must hold the SAME share count on every leg (a per-USD size would buy
+unequal shares and break the guarantee). 5 = Polymarket's order
+minimum, i.e. the smallest *fillable* unit. If the real book can't even
+supply 5 shares on every leg, the arb is not executable (artifact)."""
+
+MAX_PLAUSIBLE_LEGS: int = 40
+"""Defensive cap. A 'guaranteed' arb spanning more than this many legs
+is almost always an empty-book sum, not a real lock."""
 
 
 def _now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _fill_shares(
+    depth: Any, shares_target: float, limit_price: float = 1.0,
+) -> tuple[float, float] | None:
+    """Walk an ask ladder (cheapest-first) for `shares_target` shares.
+
+    Returns (avg_fill_price, filled_shares) or None if the book is
+    empty / absent. `filled_shares` may be < target on a thin book —
+    the caller treats a short fill as "leg unfillable".
+    """
+    asks = getattr(depth, "asks", None)
+    if not asks:
+        return None
+    taken = 0.0
+    cost = 0.0
+    for lv in asks:  # get_depth returns asks sorted ascending by price
+        p = float(getattr(lv, "price", 0.0))
+        s = float(getattr(lv, "size_shares", 0.0))
+        if p <= 0.0 or p > limit_price + 1e-9 or s <= 0.0:
+            continue
+        take = min(shares_target - taken, s)
+        taken += take
+        cost += take * p
+        if taken >= shares_target - 1e-9:
+            break
+    if taken <= 0.0:
+        return None
+    return (cost / taken, taken)
 
 
 def _log_event(record: dict, log_path: Path = DEFAULT_LOG_PATH) -> None:
@@ -157,11 +197,25 @@ def detect_and_execute_consistency_arb(
     portfolio_path: Path = Path("data/portfolio.json"),
     size_usd: float = DEFAULT_SIZE_USD,
     min_margin_usd: float = MIN_MARGIN_USD,
+    shares_per_leg: int = SHARES_PER_LEG,
+    book_cache: Any = None,
     log_path: Path = DEFAULT_LOG_PATH,
     verbose: bool = False,
 ) -> dict[str, int]:
-    """Scan event list for max/min consistency arbs, fire paper trades
-    on opportunities ≥ min_margin_usd."""
+    """Scan event list for max/min consistency arbs.
+
+    Hardened (2026-06-02): a candidate that clears the cheap top-of-book
+    pre-filter is then re-priced against the REAL ask ladder
+    (`book_cache.get_depth`) for `shares_per_leg` shares on EVERY leg,
+    with taker fees subtracted. Any leg that can't supply the full share
+    count (empty/stale/thin book) fails the whole arb — this is the
+    artifact filter that kills empty-book sums masquerading as fat
+    margins. Only depth-checked, fee-netted survivors are written to the
+    log; the rejection funnel is returned in the counts dict.
+
+    With `book_cache=None` it falls back to the legacy top-of-book log
+    (depth_aware=False) so non-daemon callers/tests still work."""
+    from weather_bot.fees import taker_fee_usd
     from weather_bot.locations import STATIONS_BY_ID
     from weather_bot.polymarket import (
         event_target_date, match_event_to_station, parse_bucket,
@@ -226,55 +280,110 @@ def detect_and_execute_consistency_arb(
             if cost_max_leg is None or cost_min_leg is None:
                 continue
             cost = cost_max_leg + cost_min_leg
-            # Combined payout: $1 (min always ≤ max, so exactly one of
-            # "max ≥ T" or "min < T" wins when they don't both win;
-            # when both win, payout is $2 — but for the worst-case
-            # guaranteed margin we use min-payout = $1).
-            arb_margin = 1.0 - cost
-            if arb_margin < min_margin_usd:
+            # STAGE 1 — cheap top-of-book pre-filter. Σ yes_ask (1 share
+            # per leg). Min payout = $1 (min ≤ max ⇒ at least one leg
+            # wins). Skip the vast majority here without touching depth.
+            gross_margin = 1.0 - cost
+            if gross_margin < min_margin_usd:
                 counts["below_margin"] += 1
                 continue
 
+            legs = list(max_buckets) + list(min_buckets)
+
+            # No depth source → legacy top-of-book log (non-daemon callers).
+            if book_cache is None:
+                counts["opportunities"] += 1
+                counts["placed"] += 1
+                _log_event({
+                    "ts_utc": now_utc.isoformat(),
+                    "result": "opportunity", "depth_aware": False,
+                    "station_id": sid, "target_date": td_iso,
+                    "threshold": int(T), "bucket_width": int(bucket_width),
+                    "cost_usd": float(cost),
+                    "gross_margin_top_of_book_usd": float(gross_margin),
+                    "n_max_buckets": int(n_max), "n_min_buckets": int(n_min),
+                }, log_path)
+                continue
+
+            # STAGE 2 — DEPTH + FEES + ARTIFACT FILTER.
+            # The arb needs EQUAL shares on every leg (it pays $shares
+            # whichever bucket wins). Walk each leg's real ask ladder for
+            # `shares_per_leg`; if ANY leg can't supply them the basket
+            # has a hole and the "$1 guaranteed" breaks → artifact (this
+            # is exactly the empty-book sum that fakes a fat margin).
+            if (n_max + n_min) > MAX_PLAUSIBLE_LEGS:
+                counts["rej_too_many_legs"] += 1
+                continue
+
+            S = float(shares_per_leg)
+            depth_cost = 0.0
+            total_fees = 0.0
+            leg_fills: list[dict] = []
+            reject = None
+            for m in legs:
+                tok = getattr(m, "yes_token_id", None)
+                depth = book_cache.get_depth(tok) if tok else None
+                if depth is None:
+                    reject = "no_depth"      # cache miss / stale / empty book
+                    break
+                fr = _fill_shares(depth, S)
+                if fr is None or fr[1] < S - 1e-9:
+                    reject = "thin_depth"     # book present but < S shares
+                    break
+                avg, got = fr
+                depth_cost += avg * got
+                total_fees += taker_fee_usd(got, avg)
+                leg_fills.append({
+                    "bucket_label": getattr(m, "bucket_label", ""),
+                    "yes_token_id": tok,
+                    "avg_fill_price": round(avg, 4),
+                    "shares": round(got, 2),
+                })
+            if reject is not None:
+                counts[f"rej_{reject}"] += 1
+                continue
+
+            payout = S  # guaranteed minimum ($1/share × S, min-payout case)
+            net_margin = payout - depth_cost - total_fees
+            net_per_share = net_margin / S
+            # STAGE 3 — net-of-fee floor (per-share, comparable to the old
+            # gross margin). A depth-fillable arb whose edge is eaten by
+            # fees is not worth executing.
+            if net_per_share < min_margin_usd:
+                counts["rej_thin_net"] += 1
+                continue
+
             counts["opportunities"] += 1
+            counts["placed"] += 1
             if verbose:
                 print(f"  [cons-arb] {sid} {td_iso} T={T}: "
-                      f"cost_max={cost_max_leg:.3f}, cost_min_lt={cost_min_leg:.3f}, "
-                      f"margin=${arb_margin:.3f}")
+                      f"gross_tob=${gross_margin:.3f}  "
+                      f"net/sh=${net_per_share:.3f}  "
+                      f"({n_max}+{n_min} legs × {int(S)}sh, "
+                      f"fees=${total_fees:.3f})")
 
             _log_event({
                 "ts_utc": now_utc.isoformat(),
                 "result": "opportunity",
+                "depth_aware": True,
                 "station_id": sid,
                 "target_date": td_iso,
                 "threshold": int(T),
                 "bucket_width": int(bucket_width),
-                # CORRECTED COST MATH (2026-05-28):
-                # cost_max_leg = sum(yes_ask) for max-buckets fully ≥ T
-                # cost_min_leg = sum(yes_ask) for min-buckets fully < T
-                # Both are real implementable prices (we BUY YES at ASK
-                # on both legs). cost = sum; arb_margin = 1 - cost.
-                "cost_max_leg_usd": float(cost_max_leg),
-                "cost_min_lt_leg_usd": float(cost_min_leg),
-                "cost_usd": float(cost),
-                "arb_margin_usd": float(arb_margin),
+                "shares_per_leg": int(S),
                 "n_max_buckets": int(n_max),
                 "n_min_buckets": int(n_min),
-                "max_legs": [
-                    {"market_id": int(getattr(m, "market_id", 0)),
-                     "bucket_label": getattr(m, "bucket_label", ""),
-                     "yes_token_id": getattr(m, "yes_token_id", None),
-                     "yes_ask": float(m.yes_ask)}
-                    for m in max_buckets
-                ],
-                "min_legs": [
-                    {"market_id": int(getattr(m, "market_id", 0)),
-                     "bucket_label": getattr(m, "bucket_label", ""),
-                     "yes_token_id": getattr(m, "yes_token_id", None),
-                     "yes_ask": float(m.yes_ask)}
-                    for m in min_buckets
-                ],
-                "size_usd": size_usd,
-            })
-            counts["placed"] += 1
+                "n_legs": int(n_max + n_min),
+                # Old top-of-book metric, kept for before/after comparison.
+                "cost_usd": float(cost),
+                "gross_margin_top_of_book_usd": float(gross_margin),
+                # Hardened economics (the trustworthy numbers):
+                "depth_cost_usd": float(depth_cost),
+                "total_fees_usd": float(total_fees),
+                "payout_usd": float(payout),
+                "net_margin_usd": float(net_margin),
+                "net_margin_per_share_usd": float(net_per_share),
+                "legs": leg_fills,
+            }, log_path)
 
     return dict(counts)

@@ -398,25 +398,49 @@ with tabs[4]:
 # Tab 5 — Consistency arb
 with tabs[5]:
     st.caption("Cross-event arb: P(min ≥ T) > P(max ≥ T) is impossible. "
-               "Detect + log when prices violate.")
+               "HARDENED — each candidate re-priced on the real ask ladder "
+               "for 5 shares/leg, taker fees subtracted, empty-book "
+               "artifacts dropped. Shadow only (never executed).")
     if cons_arb:
-        df = pd.DataFrame(cons_arb).sort_values("ts_utc", ascending=False).head(80)
-        cols = [c for c in ["ts_utc", "station_id", "target_date", "threshold",
-                            "p_max_ge_T", "p_min_ge_T", "cost_usd",
-                            "arb_margin_usd", "n_max_buckets", "n_min_buckets"]
-                if c in df.columns]
-        st.dataframe(df[cols], use_container_width=True, hide_index=True)
+        hardened = [r for r in cons_arb if r.get("depth_aware")]
+        legacy = [r for r in cons_arb if not r.get("depth_aware")]
+        st.write(f"**{len(hardened)}** depth-checked, net-of-fee opportunity "
+                 f"records  ·  {len(legacy)} legacy top-of-book records "
+                 f"(pre-hardening, excluded from the stats below)")
+        if hardened:
+            df = pd.DataFrame(hardened).sort_values("ts_utc", ascending=False).head(80)
+            cols = [c for c in ["ts_utc", "station_id", "target_date", "threshold",
+                                "n_legs", "shares_per_leg",
+                                "gross_margin_top_of_book_usd",
+                                "depth_cost_usd", "total_fees_usd",
+                                "net_margin_usd", "net_margin_per_share_usd"]
+                    if c in df.columns]
+            st.dataframe(df[cols], use_container_width=True, hide_index=True)
 
-        st.subheader("Margin distribution")
-        margins = [r["arb_margin_usd"] for r in cons_arb
-                   if r.get("arb_margin_usd") is not None]
-        if margins:
-            col1, col2, col3 = st.columns(3)
-            col1.metric("N opportunities", len(margins))
-            col2.metric("Median margin", f"${sorted(margins)[len(margins)//2]:.3f}")
-            col3.metric("Max margin", f"${max(margins):.3f}")
+            st.subheader("Net margin per share (after depth + fees), distinct arbs")
+            best: dict = {}
+            for r in hardened:
+                k = (r.get("station_id"), r.get("target_date"), r.get("threshold"))
+                v = r.get("net_margin_per_share_usd")
+                if v is None:
+                    continue
+                if k not in best or v > best[k]:
+                    best[k] = v
+            vals = sorted(best.values())
+            if vals:
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Distinct arbs", len(vals))
+                c2.metric("Median net/sh", f"${vals[len(vals)//2]:.3f}")
+                c3.metric("Max net/sh", f"${max(vals):.3f}")
+                c4.metric("Σ best net/sh", f"${sum(vals):.3f}")
+                st.caption("The pre-hardening empty-book fat tail (e.g. KMIA "
+                           "$0.735 gross) is filtered out — these are "
+                           "depth-fillable, net-of-fee margins only.")
+        else:
+            st.info("No depth-checked opportunities yet — the hardened daemon "
+                    "needs a refresh tick with live book depth to populate this.")
     else:
-        st.info("No consistency-arb opportunities yet. Strategy scans paired "
+        st.info("No consistency-arb records yet. Strategy scans paired "
                 "(max, min) events at every 5-min refresh.")
 
 
