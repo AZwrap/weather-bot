@@ -90,6 +90,13 @@ PAPER_ONLY: bool = True
 # positions just ride to resolution. Flip True to re-enable.
 CONSENSUS_YES_ENABLED: bool = False
 
+# Layer 7 (guaranteed_no_buy) DISABLED 2026-06-02 by operator request.
+# Post-decommission data had it at ~92% redeem vs ~97% breakeven at the
+# $0.98 cap — a structural bleeder. Both call sites are gated on this flag
+# (code + logs retained, tab dropped from the dashboard) so a single flip
+# re-enables it without re-adding the calls.
+LAYER7_ENABLED: bool = False
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -241,9 +248,10 @@ async def on_wug_update(state: DaemonState, upd: WUGUpdate) -> None:
         print(f"  [lock-in] failed: {type(exc).__name__}: {exc}",
               file=sys.stderr)
 
-    # 2) Layer 7 progressive
+    # 2) Layer 7 progressive — gated on LAYER7_ENABLED (disabled). When off,
+    # `counts` is falsy and the print guard below short-circuits.
     try:
-        counts = detect_and_execute_guaranteed_buys(
+        counts = LAYER7_ENABLED and detect_and_execute_guaranteed_buys(
             station_id=upd.station_id,
             target_date_iso=upd.target_date_iso,
             observed_extreme_c=upd.observed_extreme_c,
@@ -721,7 +729,7 @@ async def _no_side_sweep_loop(state: "DaemonState", interval_s: float = 5.0) -> 
                 if extreme is None:
                     continue  # Layer7 + HBN need the observed extreme
                 try:
-                    detect_and_execute_guaranteed_buys(
+                    LAYER7_ENABLED and detect_and_execute_guaranteed_buys(
                         station_id=sid, target_date_iso=td_iso,
                         observed_extreme_c=extreme, target=target,
                         bucket_snapshots=list(ev.markets), client=state.client,
@@ -1029,7 +1037,9 @@ async def main_async() -> int:
         f"[daemon] start  paper_only={PAPER_ONLY}  "
         f"dry_run={state.client.is_dry_run}  "
         f"wug_interval={args.wug_poll_interval}s  "
-        f"events_refresh={args.events_refresh_interval}s"
+        f"events_refresh={args.events_refresh_interval}s  "
+        f"layer7={'on' if LAYER7_ENABLED else 'OFF'}  "
+        f"consensus_yes={'on' if CONSENSUS_YES_ENABLED else 'OFF'}"
     )
 
     # Install signal handlers (UNIX). Windows skips silently.

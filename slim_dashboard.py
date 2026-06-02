@@ -37,6 +37,7 @@ LOGS = {
     "consistency_arb": DATA / "consistency_arb_log.jsonl",
     "consensus_yes": DATA / "consensus_yes_log.jsonl",
     "consensus_yes_exit": DATA / "consensus_yes_exit_log.jsonl",
+    "consensus_basket": DATA / "consensus_basket_log.jsonl",
     "forward_log": DATA / "forward_log.jsonl",
     "publication_window": DATA / "publication_window_log.jsonl",
     "portfolio_audit": DATA / "portfolio_save_audit.jsonl",
@@ -176,6 +177,7 @@ pers_tail = load_jsonl(str(LOGS["persistence_tail"]))
 cons_arb = load_jsonl(str(LOGS["consistency_arb"]))
 cons_yes = load_jsonl(str(LOGS["consensus_yes"]))
 cons_yes_exit = load_jsonl(str(LOGS["consensus_yes_exit"]))
+basket = load_jsonl(str(LOGS["consensus_basket"]))
 forward_log = load_jsonl(str(LOGS["forward_log"]))
 pub_window = load_jsonl(str(LOGS["publication_window"]))
 audit = load_jsonl(str(LOGS["portfolio_audit"]))
@@ -217,17 +219,16 @@ top[5].metric("Strategy fires today", total_fires_today)
 
 # ── Tabs ────────────────────────────────────────────────────────────
 tabs = st.tabs([
-    "Strategy fires",
-    "WUG / lock-in",
-    "Layer 7",
-    "V2 preposit",
-    "High-bucket NO",
-    "Persistence tail",
-    "Consistency arb",
-    "Consensus YES",
-    "Publication window",
-    "Portfolio",
-    "Logs",
+    "Strategy fires",     # 0
+    "WUG / lock-in",      # 1
+    "Consensus basket",   # 2
+    "V2 preposit",        # 3
+    "High-bucket NO",     # 4
+    "Persistence tail",   # 5
+    "Consistency arb",    # 6
+    "Publication window", # 7
+    "Portfolio",          # 8
+    "Logs",               # 9
 ])
 
 # Tab 0 — Combined strategy fires
@@ -245,17 +246,18 @@ with tabs[0]:
                 "size_usd": None,
                 "reason": (r.get("reason") or "")[:60],
             })
-    for r in layer7:
-        if r.get("result") == "filled":
+    for r in basket:
+        # One basket = one winner (YES) leg; NO fade legs aren't separate fires.
+        if r.get("result") == "filled" and r.get("side") == "YES":
             rows.append({
-                "strategy": "Layer 7",
+                "strategy": "consensus basket",
                 "ts": r.get("ts_utc"),
                 "station": r.get("station_id"),
                 "target": r.get("target") or "—",
                 "date": r.get("target_date"),
                 "bucket": r.get("bucket_label"),
                 "size_usd": r.get("size_usd"),
-                "reason": f"obs={r.get('observed_extreme_c')}",
+                "reason": f"winner @ ${(r.get('fill_price') or 0):.3f}",
             })
     for r in v2:
         if r.get("decision") == "placed":
@@ -306,18 +308,6 @@ with tabs[0]:
                 "size_usd": r.get("size_usd"),
                 "reason": f"margin=${r.get('arb_margin_usd'):.3f}",
             })
-    for r in cons_yes:
-        if r.get("result") == "filled":
-            rows.append({
-                "strategy": "consensus YES",
-                "ts": r.get("ts_utc"),
-                "station": r.get("station_id"),
-                "target": r.get("target"),
-                "date": r.get("target_date"),
-                "bucket": r.get("bucket_label"),
-                "size_usd": r.get("size_usd"),
-                "reason": f"yes_ask=${r.get('yes_ask_snapshot'):.3f}",
-            })
     if rows:
         df = pd.DataFrame(rows).sort_values("ts", ascending=False)
         st.write(f"**{len(df)} fires** across all strategies (paper)")
@@ -348,39 +338,36 @@ with tabs[1]:
         st.info("No intraday decisions logged yet.")
 
 
-# Tab 2 — Layer 7 detail
+# Tab 2 — Consensus basket
 with tabs[2]:
-    if layer7:
-        results = Counter(r.get("result") for r in layer7)
-        st.subheader("Outcome distribution")
-        st.write(dict(results.most_common(10)))
+    st.caption("On a bucket's YES crossing the trigger (0.85): BUY YES on that "
+               "winner + BUY NO on every other bucket (FAK taker), hold to "
+               "resolution. Locks on a FILLABLE winner, not the first cross.")
+    if basket:
+        fills = [r for r in basket if r.get("result") == "filled"]
+        winners = [r for r in fills if r.get("side") == "YES"]
+        no_legs = [r for r in fills if r.get("side") == "NO"]
+        deployed = sum((r.get("size_usd") or 0) for r in fills)
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Baskets (winner legs)", len(winners))
+        c2.metric("NO fade legs", len(no_legs))
+        c3.metric("Total legs filled", len(fills))
+        c4.metric("Deployed (paper)", f"${deployed:.2f}")
 
-        st.subheader("Recent fills (last 50)")
-        fills = [r for r in layer7 if r.get("result") == "filled"]
-        if fills:
-            df = pd.DataFrame(fills).sort_values("ts_utc", ascending=False).head(50)
-            cols = [c for c in ["ts_utc", "station_id", "target_date", "bucket_label",
-                                "fill_price", "shares", "size_usd",
-                                "observed_extreme_c", "no_ask_at_attempt",
-                                "no_ask_source"]
-                    if c in df.columns]
-            st.dataframe(df[cols], use_container_width=True, hide_index=True)
-        else:
-            st.caption("No filled Layer 7 fires yet.")
+        st.subheader("Recent leg fills (last 80)")
+        df = pd.DataFrame(fills).sort_values("ts_utc", ascending=False).head(80)
+        cols = [c for c in ["ts_utc", "side", "station_id", "target", "target_date",
+                            "bucket_label", "bucket_kind", "bucket_threshold",
+                            "limit", "fill_price", "shares", "size_usd",
+                            "depth_source"]
+                if c in df.columns]
+        st.dataframe(df[cols], use_container_width=True, hide_index=True)
 
-        st.subheader("Margin-filtered skips (oracle-disagreement guard)")
-        margin = load_jsonl(str(LOGS["layer7_margin_filtered"]))
-        if margin:
-            df = pd.DataFrame(margin).tail(30)
-            cols = [c for c in ["ts_utc", "station_id", "bucket_label",
-                                "observed_extreme_c", "margin_c",
-                                "yes_ask", "no_ask_implied"]
-                    if c in df.columns]
-            st.dataframe(df[cols], use_container_width=True, hide_index=True)
-        else:
-            st.caption("No margin-filtered records yet.")
+        st.caption("Net-of-fee P&L is scored offline by analyze_consensus_basket.py "
+                   "(winner redeems at $1, fade legs expire worthless) — not live here.")
     else:
-        st.info("No Layer 7 records logged yet.")
+        st.info("No consensus-basket fires yet. Fires when a bucket's YES crosses "
+                "the trigger (0.85) with fillable depth.")
 
 
 # Tab 3 — V2 preposit
@@ -484,57 +471,8 @@ with tabs[6]:
                 "(max, min) events at every 5-min refresh.")
 
 
-# Tab 7 — Consensus YES
+# Tab 7 — Publication window
 with tabs[7]:
-    st.warning("⚠️ HIGHEST-RISK strategy in the rebuild. Closest path back "
-               "to the prior NO_momentum bleed. Watch resolved win rate "
-               "closely once N≥10 fires accumulate.")
-    if cons_yes:
-        filled = [r for r in cons_yes if r.get("result") == "filled"]
-        st.write(f"**{len(filled)}** filled, {len(cons_yes)-len(filled)} non-fill log entries.")
-        if filled:
-            df = pd.DataFrame(filled).sort_values("ts_utc", ascending=False).head(50)
-            cols = [c for c in ["ts_utc", "station_id", "target", "target_date",
-                                "bucket_label", "bucket_threshold",
-                                "yes_ask_snapshot", "submitted_limit", "fill_price",
-                                "second_yes_ask", "n_mids_in_event",
-                                "shares", "size_usd"]
-                    if c in df.columns]
-            st.dataframe(df[cols], use_container_width=True, hide_index=True)
-    else:
-        st.info("No consensus-YES fires yet. Strategy fires when the leading "
-                "mid bucket's yes_ask is in [$0.40, $0.85].")
-
-    # Trailing-stop exits
-    st.subheader("Trailing-stop exits (consensus YES)")
-    st.caption("Sell when current_yes_ask < peak AND ≥ entry + $0.05. "
-               "Holds while price climbs; only locks gains on a turn-down.")
-    if cons_yes_exit:
-        sold = [r for r in cons_yes_exit if r.get("result") == "sold"]
-        st.write(f"**{len(sold)}** sold, {len(cons_yes_exit)-len(sold)} non-sell log entries.")
-        if sold:
-            df = pd.DataFrame(sold).sort_values("ts_utc", ascending=False).head(50)
-            cols = [c for c in ["ts_utc", "trigger", "exit_reason",
-                                "station_id", "bucket_label",
-                                "entry_price", "peak_yes_bid", "ratchet_floor",
-                                "hard_stop_level",
-                                "current_yes_bid", "submitted_sell_limit",
-                                "fill_price", "shares",
-                                "net_per_share_usd", "net_total_usd"]
-                    if c in df.columns]
-            st.dataframe(df[cols], use_container_width=True, hide_index=True)
-
-            total_net = sum(r.get("net_total_usd", 0) for r in sold)
-            col1, col2, col3 = st.columns(3)
-            col1.metric("Exits", len(sold))
-            col2.metric("Total net (paper)", f"${total_net:+.2f}")
-            col3.metric("Avg per exit", f"${total_net/len(sold):+.2f}")
-    else:
-        st.info("No trailing-stop exits yet.")
-
-
-# Tab 8 — Publication window
-with tabs[8]:
     if pub_window:
         st.write(f"**{len(pub_window)}** publication-window snapshots.")
         df = pd.DataFrame([
@@ -570,8 +508,8 @@ with tabs[8]:
         )
 
 
-# Tab 6 — Portfolio
-with tabs[9]:
+# Tab 8 — Portfolio
+with tabs[8]:
     if isinstance(portfolio, dict) and portfolio.get("positions"):
         pos = portfolio["positions"]
         st.write(f"**{len(pos)}** synthetic positions (paper, dry_run=True).")
@@ -596,11 +534,12 @@ with tabs[9]:
         # Tracker — Layer 7 progressive eval state
         le = portfolio.get("last_evaluated_max_by_sk", {})
         if le:
-            st.subheader("Layer 7 progressive-eval tracker")
+            st.subheader("Progressive-eval tracker (high-bucket NO)")
             st.caption(
-                "Highest temp (int, market unit) we've already evaluated dead "
-                "buckets up to. New WUG readings above this trigger evaluation "
-                "of the next-up bucket."
+                "Highest temp (int, market unit) already evaluated for dead "
+                "buckets per (station, target). New WUG readings above this "
+                "trigger evaluation of the next-up bucket. (Shared tracker — "
+                "Layer 7 also used it but is now disabled.)"
             )
             tracker_df = pd.DataFrame([
                 {"key": k, "last_evaluated_int": v} for k, v in le.items()
@@ -610,8 +549,8 @@ with tabs[9]:
         st.info("No positions in portfolio.json yet.")
 
 
-# Tab 7 — Logs
-with tabs[10]:
+# Tab 9 — Logs
+with tabs[9]:
     n_lines = st.slider("Lines to show", min_value=50, max_value=1000,
                         value=200, step=50)
     grep_filter = st.text_input("Filter (substring match)", value="")
