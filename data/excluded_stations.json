@@ -12,12 +12,6 @@
     "reason": "REMOVED-BY-POLYMARKET (user-verified 2026-05-21 against Polymarket UI): Polymarket no longer publishes weather markets for Jakarta. The bot's match_event_to_station won't find events for this station anyway, but adding to exclusion list as belt-and-suspenders in case Polymarket re-adds with a different format. Re-evaluate when Polymarket publishes Jakarta markets again with confirmed-correct station identification."
   },
   {
-    "station_id": "ZSQD",
-    "target": "*",
-    "expires": "2027-01-01",
-    "reason": "REMOVED-BY-POLYMARKET (user-verified 2026-05-21 against Polymarket UI): Polymarket no longer publishes weather markets for Qingdao. The bot's match_event_to_station won't find events for this station anyway, but adding to exclusion list as belt-and-suspenders in case Polymarket re-adds with a different format. Re-evaluate when Polymarket publishes Qingdao markets again with confirmed-correct station identification."
-  },
-  {
     "station_id": "LTFM",
     "target": "*",
     "expires": "2027-01-01",
