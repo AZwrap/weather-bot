@@ -194,6 +194,7 @@ EXCLUDED = {"LTFM", "LLBG", "UUWW", "VHHH", "DNMM"}  # now untradeable (dodgy so
 
 
 def main():
+    TRIG = float(sys.argv[1]) if len(sys.argv) > 1 else 0.85
     rows = load_jsonl(SWEEP)
     resmap = resolution_map()
     by_ev = defaultdict(list)
@@ -205,8 +206,8 @@ def main():
            for scope in ("all", "clean")}
     detail = []
     for (sid, tgt, date), evrows in by_ev.items():
-        rm = simulate_event(evrows, resmap, obs_confirmed=False)
-        ro = simulate_event(evrows, resmap, obs_confirmed=True)
+        rm = simulate_event(evrows, resmap, obs_confirmed=False, trigger=TRIG)
+        ro = simulate_event(evrows, resmap, obs_confirmed=True, trigger=TRIG)
         if rm is None or ro is None:
             continue
         static_pnl, mkt_pnl, n_flips = rm
