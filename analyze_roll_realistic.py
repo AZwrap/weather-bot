@@ -113,7 +113,7 @@ def sell_proceeds(shares, bid):
     return shares * bid - taker_fee_usd(shares, bid)
 
 
-def simulate_event(rows, resmap, obs_confirmed=False, trigger=TRIGGER):
+def simulate_event(rows, resmap, stop="any", trigger=TRIGGER):
     """Return (static_pnl, roll_pnl, n_flips) for one event, or None.
 
     obs_confirmed=True models the operator's actual idea: only roll OUT of a
@@ -160,13 +160,24 @@ def simulate_event(rows, resmap, obs_confirmed=False, trigger=TRIGGER):
         new_label = r["winner"]["bucket_label"]
         if new_label == cur or float(r.get("leader_yes_ask", 0)) < trigger:
             continue
-        # obs-confirmed: don't roll out of a bucket that ultimately WINS —
-        # the observed max would never have passed it, so no death signal.
-        if obs_confirmed and cur in held and held[cur]["side"] == "YES" \
-                and leg_won(held[cur], actual_int, unit):
-            continue
-        # ---- ROLL  cur -> new_label ----
         fade_by = {l["bucket_label"]: l for l in r.get("fade_no", [])}
+        # ---- STOP-MODE GATE: decide whether to roll ----
+        if stop == "obs":
+            # only roll out of a genuinely-dead favorite (perfect foresight)
+            if cur in held and held[cur]["side"] == "YES" and leg_won(held[cur], actual_int, unit):
+                continue
+        elif stop == "pp10":
+            # roll only when the held YES dropped >=10pp from entry (a big,
+            # informative move — filters small leader-flicker whipsaws). NOTE:
+            # the sell is still priced at the flip-time snapshot (we lack
+            # sub-flip price snapshots), so this isolates the THRESHOLD effect,
+            # not the "sell earlier at a less-collapsed price" effect.
+            ncur0 = fade_by.get(cur)
+            cur_px = (1.0 - float(ncur0["observed_ask"])) if (ncur0 and ncur0.get("observed_ask") is not None) else 0.0
+            if not (cur in held and held[cur]["side"] == "YES" and cur_px <= held[cur]["entry"] - 0.10):
+                continue
+        # stop == "any" → roll on every flip (no gate)
+        # ---- ROLL  cur -> new_label ----
         # 1) sell held YES-cur — DEPTH-AWARE. YES_bid ladder ≡ NO_ask ladder
         # (same resting orders), and the fade NO-cur leg logs the DEPTH-WALKED
         # buy fill, so 1 - fill_price is the avg price selling ~$5 of YES-cur
@@ -211,8 +222,8 @@ def main():
            for scope in ("all", "clean")}
     detail = []
     for (sid, tgt, date), evrows in by_ev.items():
-        rm = simulate_event(evrows, resmap, obs_confirmed=False, trigger=TRIG)
-        ro = simulate_event(evrows, resmap, obs_confirmed=True, trigger=TRIG)
+        rm = simulate_event(evrows, resmap, stop="any", trigger=TRIG)
+        ro = simulate_event(evrows, resmap, stop="obs", trigger=TRIG)
         if rm is None or ro is None:
             continue
         static_pnl, mkt_pnl, n_flips = rm
@@ -244,19 +255,20 @@ def main():
     print()
     # ---- multi-trigger sweep (clean tradeable set) ----
     print()
-    print("OBS-ROLL ACROSS TRIGGER PRICES  (clean tradeable set)")
-    print("  trig   static    mkt-roll(Δ)      obs-roll(Δ)")
-    for trig in [0.78, 0.82, 0.85, 0.90, 0.92, 0.95]:
-        st=mk=ob=0.0; n=0
+    print("STOP MODES ACROSS TRIGGERS (clean set)  static / mkt-flip / pp10-drop / obs-death")
+    print("  trig   static      mkt(Δ)        pp10(Δ)       obs(Δ)")
+    for trig in [0.78, 0.80, 0.82, 0.85, 0.90, 0.95]:
+        st=mk=pp=ob=0.0
         for (sid, tgt, date), evrows in by_ev.items():
             if sid in EXCLUDED:
                 continue
-            rm = simulate_event(evrows, resmap, obs_confirmed=False, trigger=trig)
-            ro = simulate_event(evrows, resmap, obs_confirmed=True, trigger=trig)
-            if rm is None or ro is None:
+            rm = simulate_event(evrows, resmap, stop="any", trigger=trig)
+            rp = simulate_event(evrows, resmap, stop="pp10", trigger=trig)
+            ro = simulate_event(evrows, resmap, stop="obs", trigger=trig)
+            if rm is None:
                 continue
-            st += rm[0]; mk += rm[1]; ob += ro[1]; n += 1
-        print("  %.2f  $%+7.2f   $%+7.2f (%+6.2f)  $%+7.2f (%+6.2f)" % (trig, st, mk, mk-st, ob, ob-st))
+            st += rm[0]; mk += rm[1]; pp += rp[1]; ob += ro[1]
+        print("  %.2f  $%+7.2f  $%+7.2f(%+5.1f)  $%+7.2f(%+5.1f)  $%+7.2f(%+5.1f)" % (trig, st, mk, mk-st, pp, pp-st, ob, ob-st))
     print()
     print("FLIPPED EVENTS  (static -> mkt-roll / obs-roll)")
     for sid, tgt, date, st, mk, ob, nf in sorted(detail, key=lambda x: x[5] - x[3]):
