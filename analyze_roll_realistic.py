@@ -107,7 +107,7 @@ def mk_leg(side, snap):
 
 
 def sell_proceeds(shares, bid):
-    """Cash from selling `shares` at top-of-book `bid`, net of taker fee."""
+    """Cash from selling `shares` at depth-aware avg `bid`, net of taker fee."""
     if bid is None or bid <= 0.0:
         return 0.0
     return shares * bid - taker_fee_usd(shares, bid)
@@ -167,15 +167,20 @@ def simulate_event(rows, resmap, obs_confirmed=False, trigger=TRIGGER):
             continue
         # ---- ROLL  cur -> new_label ----
         fade_by = {l["bucket_label"]: l for l in r.get("fade_no", [])}
-        # 1) sell held YES-cur at its real top-of-book bid (= 1 - NO-cur ask)
+        # 1) sell held YES-cur — DEPTH-AWARE. YES_bid ladder ≡ NO_ask ladder
+        # (same resting orders), and the fade NO-cur leg logs the DEPTH-WALKED
+        # buy fill, so 1 - fill_price is the avg price selling ~$5 of YES-cur
+        # into the collapsed book (≥ a top-of-book overestimate → conservative).
         if cur in held and held[cur]["side"] == "YES":
             ncur = fade_by.get(cur)
-            yes_bid_cur = (1.0 - float(ncur["observed_ask"])) if (ncur and ncur.get("observed_ask") is not None) else 0.0
+            yes_bid_cur = (1.0 - float(ncur["fill_price"])) if (ncur and ncur.get("fill_price") is not None) else 0.0
             cash += sell_proceeds(held[cur]["shares"], yes_bid_cur)
             del held[cur]
-        # 2) sell held NO-new at its real top-of-book bid (= 1 - YES-new ask)
+        # 2) sell held NO-new — DEPTH-AWARE. winner YES-new's depth-walked buy
+        # fill walks the YES-new ask = NO-new bid ladder, so 1 - fill_price is
+        # the avg NO-new sell price into depth.
         if new_label in held and held[new_label]["side"] == "NO":
-            no_bid_new = 1.0 - float(r["winner"]["observed_ask"]) if r["winner"].get("observed_ask") is not None else 0.0
+            no_bid_new = (1.0 - float(r["winner"]["fill_price"])) if r["winner"].get("fill_price") is not None else 0.0
             cash += sell_proceeds(held[new_label]["shares"], no_bid_new)
             del held[new_label]
         # 3) buy YES-new (the new favorite) at its logged depth-walked fill
