@@ -63,9 +63,12 @@ doesn't pre-empt a winner that becomes fillable later; only a transient
 quote that REVERTS below 0.85 is skipped earlier (no count), so this only
 bites a persistently-stuck dead book."""
 
-TRIGGER_YES: float = 0.85
+TRIGGER_YES: float = 0.82
 """A bucket's YES ask must reach this for it to count as the emerged
-winner and trigger the basket."""
+winner and trigger the basket. Lowered 0.85→0.82 (2026-06-03): the
+per-trigger sweep curve put 0.85 in a NEGATIVE pocket (−$24, N=39) while
+0.82 sat in a positive one (+$33 static / +$28 clean). Small-N, PAPER —
+this is a live A/B of the better-measured trigger, not a proven edge."""
 
 SIZE_USD: float = 5.0
 """Per-leg notional (winner YES + each loser NO)."""
