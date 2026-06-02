@@ -74,6 +74,7 @@ from weather_bot.polymarket_ws import BookCache, subscribe_and_watch
 from weather_bot.portfolio import DEFAULT_PORTFOLIO_PATH, Portfolio
 from weather_bot.publication_window import midend_local_utc, snapshot_one
 from weather_bot.v2_conditional_preposit import (
+    V2_ENABLED,
     submit_v2_conditional_preposit_orders,
 )
 from weather_bot.wug_poller import WUGPollerPool, WUGUpdate
@@ -1039,7 +1040,8 @@ async def main_async() -> int:
         f"wug_interval={args.wug_poll_interval}s  "
         f"events_refresh={args.events_refresh_interval}s  "
         f"layer7={'on' if LAYER7_ENABLED else 'OFF'}  "
-        f"consensus_yes={'on' if CONSENSUS_YES_ENABLED else 'OFF'}"
+        f"consensus_yes={'on' if CONSENSUS_YES_ENABLED else 'OFF'}  "
+        f"v2={'on' if V2_ENABLED else 'OFF'}"
     )
 
     # Install signal handlers (UNIX). Windows skips silently.

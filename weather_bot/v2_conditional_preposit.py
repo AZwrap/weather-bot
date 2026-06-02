@@ -98,7 +98,10 @@ from .portfolio import (
 from .scanner import TradeSignal
 
 
-V2_ENABLED: bool = True
+V2_ENABLED: bool = False  # DISABLED 2026-06-02 by operator request (same as
+# Layer 7). When False, submit_v2_conditional_preposit_orders returns early
+# ({"reason": "v2_disabled"}) with no submission and no logging. Code + logs
+# retained; flip True to re-enable. Dashboard tab dropped.
 """Strategy-level enable. True = run the V2 logic on every cycle.
 Paper-vs-live is gated separately by slim_daemon.PAPER_ONLY +
 ExecutionClient.is_dry_run.

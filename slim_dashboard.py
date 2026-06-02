@@ -222,13 +222,12 @@ tabs = st.tabs([
     "Strategy fires",     # 0
     "WUG / lock-in",      # 1
     "Consensus basket",   # 2
-    "V2 preposit",        # 3
-    "High-bucket NO",     # 4
-    "Persistence tail",   # 5
-    "Consistency arb",    # 6
-    "Publication window", # 7
-    "Portfolio",          # 8
-    "Logs",               # 9
+    "High-bucket NO",     # 3
+    "Persistence tail",   # 4
+    "Consistency arb",    # 5
+    "Publication window", # 6
+    "Portfolio",          # 7
+    "Logs",               # 8
 ])
 
 # Tab 0 — Combined strategy fires
@@ -258,19 +257,6 @@ with tabs[0]:
                 "bucket": r.get("bucket_label"),
                 "size_usd": r.get("size_usd"),
                 "reason": f"winner @ ${(r.get('fill_price') or 0):.3f}",
-            })
-    for r in v2:
-        if r.get("decision") == "placed":
-            rows.append({
-                "strategy": "V2",
-                "ts": r.get("ts_utc"),
-                "station": r.get("station_id"),
-                "target": r.get("target"),
-                "date": r.get("target_date"),
-                "bucket": r.get("bucket_label"),
-                "size_usd": r.get("intended_size_usd"),
-                "reason": f"maker@${r.get('maker_intended_price')} vs taker@{r.get('taker_no_ask'):.3f}"
-                if r.get("taker_no_ask") is not None else "",
             })
     for r in hbn:
         if r.get("result") == "filled":
@@ -370,45 +356,8 @@ with tabs[2]:
                 "the trigger (0.85) with fillable depth.")
 
 
-# Tab 3 — V2 preposit
+# Tab 3 — High-bucket NO
 with tabs[3]:
-    if v2:
-        placed = [r for r in v2 if r.get("decision") == "placed"]
-        st.write(f"**{len(placed)}** maker fires (paper); maker vs taker counterfactuals logged.")
-        if placed:
-            df = pd.DataFrame(placed).sort_values("ts_utc", ascending=False).head(50)
-            cols = [c for c in ["ts_utc", "station_id", "target_date", "bucket_label",
-                                "yes_ask", "yes_bid",
-                                "maker_intended_price", "maker_fee_per_share",
-                                "taker_no_ask", "taker_fee_per_share",
-                                "intended_size_usd",
-                                "gate_bucket_label", "gate_bucket_yes_ask"]
-                    if c in df.columns]
-            st.dataframe(df[cols], use_container_width=True, hide_index=True)
-
-            # Maker vs taker price summary
-            st.subheader("Maker (GTC @ $0.82) vs taker (FAK @ no_ask) snapshot")
-            mt = pd.DataFrame([
-                {
-                    "maker_price": r["maker_intended_price"],
-                    "taker_no_ask": r["taker_no_ask"],
-                }
-                for r in placed if r.get("taker_no_ask") is not None
-            ])
-            if not mt.empty:
-                col1, col2 = st.columns(2)
-                col1.metric("Avg maker price", f"${mt['maker_price'].mean():.4f}")
-                col2.metric(
-                    "Avg taker no_ask",
-                    f"${mt['taker_no_ask'].mean():.4f}",
-                    delta=f"{(mt['taker_no_ask']-mt['maker_price']).mean():+.4f}",
-                )
-    else:
-        st.info("No V2 records yet. V2 fires when at least one bucket in an event has yes_ask >= $0.80.")
-
-
-# Tab 4 — High-bucket NO
-with tabs[4]:
     if hbn:
         st.write(f"**{len(hbn)}** high-bucket NO log entries.")
         df = pd.DataFrame(hbn).sort_values("ts_utc", ascending=False).head(50)
@@ -425,8 +374,8 @@ with tabs[4]:
                 "(or 06:00 for min-target).")
 
 
-# Tab 5 — Persistence tail
-with tabs[5]:
+# Tab 4 — Persistence tail
+with tabs[4]:
     st.caption("NO on tail buckets 4+ steps away from yesterday's actual.")
     if pers_tail:
         filled = [r for r in pers_tail if r.get("result") == "filled"]
@@ -446,8 +395,8 @@ with tabs[5]:
                 "First fires land once the resolver populates the prior.")
 
 
-# Tab 6 — Consistency arb
-with tabs[6]:
+# Tab 5 — Consistency arb
+with tabs[5]:
     st.caption("Cross-event arb: P(min ≥ T) > P(max ≥ T) is impossible. "
                "Detect + log when prices violate.")
     if cons_arb:
@@ -471,8 +420,8 @@ with tabs[6]:
                 "(max, min) events at every 5-min refresh.")
 
 
-# Tab 7 — Publication window
-with tabs[7]:
+# Tab 6 — Publication window
+with tabs[6]:
     if pub_window:
         st.write(f"**{len(pub_window)}** publication-window snapshots.")
         df = pd.DataFrame([
@@ -508,8 +457,8 @@ with tabs[7]:
         )
 
 
-# Tab 8 — Portfolio
-with tabs[8]:
+# Tab 7 — Portfolio
+with tabs[7]:
     if isinstance(portfolio, dict) and portfolio.get("positions"):
         pos = portfolio["positions"]
         st.write(f"**{len(pos)}** synthetic positions (paper, dry_run=True).")
@@ -549,8 +498,8 @@ with tabs[8]:
         st.info("No positions in portfolio.json yet.")
 
 
-# Tab 9 — Logs
-with tabs[9]:
+# Tab 8 — Logs
+with tabs[8]:
     n_lines = st.slider("Lines to show", min_value=50, max_value=1000,
                         value=200, step=50)
     grep_filter = st.text_input("Filter (substring match)", value="")
