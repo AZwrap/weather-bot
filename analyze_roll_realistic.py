@@ -113,7 +113,7 @@ def sell_proceeds(shares, bid):
     return shares * bid - taker_fee_usd(shares, bid)
 
 
-def simulate_event(rows, resmap, obs_confirmed=False):
+def simulate_event(rows, resmap, obs_confirmed=False, trigger=TRIGGER):
     """Return (static_pnl, roll_pnl, n_flips) for one event, or None.
 
     obs_confirmed=True models the operator's actual idea: only roll OUT of a
@@ -126,7 +126,7 @@ def simulate_event(rows, resmap, obs_confirmed=False):
     # fire = first snapshot whose leader reached the trigger and has a winner
     fire = None
     for r in rows:
-        if r.get("winner") and float(r.get("leader_yes_ask", 0)) >= TRIGGER:
+        if r.get("winner") and float(r.get("leader_yes_ask", 0)) >= trigger:
             fire = r
             break
     if fire is None:
@@ -158,7 +158,7 @@ def simulate_event(rows, resmap, obs_confirmed=False):
         if not fire_seen or not r.get("winner"):
             continue
         new_label = r["winner"]["bucket_label"]
-        if new_label == cur or float(r.get("leader_yes_ask", 0)) < TRIGGER:
+        if new_label == cur or float(r.get("leader_yes_ask", 0)) < trigger:
             continue
         # obs-confirmed: don't roll out of a bucket that ultimately WINS —
         # the observed max would never have passed it, so no death signal.
@@ -235,6 +235,22 @@ def main():
         print("  mkt-roll $%+8.2f   Δ $%+7.2f" % (a["mkt"], a["mkt"] - a["static"]))
         print("  obs-roll $%+8.2f   Δ $%+7.2f   (+$%.2f vs mkt-roll: whipsaw avoided)"
               % (a["obs"], a["obs"] - a["static"], a["obs"] - a["mkt"]))
+    print()
+    # ---- multi-trigger sweep (clean tradeable set) ----
+    print()
+    print("OBS-ROLL ACROSS TRIGGER PRICES  (clean tradeable set)")
+    print("  trig   static    mkt-roll(Δ)      obs-roll(Δ)")
+    for trig in [0.78, 0.82, 0.85, 0.90, 0.92, 0.95]:
+        st=mk=ob=0.0; n=0
+        for (sid, tgt, date), evrows in by_ev.items():
+            if sid in EXCLUDED:
+                continue
+            rm = simulate_event(evrows, resmap, obs_confirmed=False, trigger=trig)
+            ro = simulate_event(evrows, resmap, obs_confirmed=True, trigger=trig)
+            if rm is None or ro is None:
+                continue
+            st += rm[0]; mk += rm[1]; ob += ro[1]; n += 1
+        print("  %.2f  $%+7.2f   $%+7.2f (%+6.2f)  $%+7.2f (%+6.2f)" % (trig, st, mk, mk-st, ob, ob-st))
     print()
     print("FLIPPED EVENTS  (static -> mkt-roll / obs-roll)")
     for sid, tgt, date, st, mk, ob, nf in sorted(detail, key=lambda x: x[5] - x[3]):
