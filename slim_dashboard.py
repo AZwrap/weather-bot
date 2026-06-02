@@ -224,10 +224,9 @@ tabs = st.tabs([
     "Consensus basket",   # 2
     "High-bucket NO",     # 3
     "Persistence tail",   # 4
-    "Consistency arb",    # 5
-    "Publication window", # 6
-    "Portfolio",          # 7
-    "Logs",               # 8
+    "Publication window", # 5
+    "Portfolio",          # 6
+    "Logs",               # 7
 ])
 
 # Tab 0 — Combined strategy fires
@@ -281,18 +280,6 @@ with tabs[0]:
                 "bucket": r.get("bucket_label"),
                 "size_usd": r.get("size_usd"),
                 "reason": f"prior={r.get('prior_c'):.1f}°C, dist={r.get('distance_buckets')}b",
-            })
-    for r in cons_arb:
-        if r.get("result") == "opportunity":
-            rows.append({
-                "strategy": "consistency arb",
-                "ts": r.get("ts_utc"),
-                "station": r.get("station_id"),
-                "target": "—",
-                "date": r.get("target_date"),
-                "bucket": f"T≥{r.get('threshold')}",
-                "size_usd": r.get("size_usd"),
-                "reason": f"margin=${r.get('arb_margin_usd'):.3f}",
             })
     if rows:
         df = pd.DataFrame(rows).sort_values("ts", ascending=False)
@@ -395,57 +382,8 @@ with tabs[4]:
                 "First fires land once the resolver populates the prior.")
 
 
-# Tab 5 — Consistency arb
+# Tab 5 — Publication window
 with tabs[5]:
-    st.caption("Cross-event arb: P(min ≥ T) > P(max ≥ T) is impossible. "
-               "HARDENED — each candidate re-priced on the real ask ladder "
-               "for 5 shares/leg, taker fees subtracted, empty-book "
-               "artifacts dropped. Shadow only (never executed).")
-    if cons_arb:
-        hardened = [r for r in cons_arb if r.get("depth_aware")]
-        legacy = [r for r in cons_arb if not r.get("depth_aware")]
-        st.write(f"**{len(hardened)}** depth-checked, net-of-fee opportunity "
-                 f"records  ·  {len(legacy)} legacy top-of-book records "
-                 f"(pre-hardening, excluded from the stats below)")
-        if hardened:
-            df = pd.DataFrame(hardened).sort_values("ts_utc", ascending=False).head(80)
-            cols = [c for c in ["ts_utc", "station_id", "target_date", "threshold",
-                                "n_legs", "shares_per_leg",
-                                "gross_margin_top_of_book_usd",
-                                "depth_cost_usd", "total_fees_usd",
-                                "net_margin_usd", "net_margin_per_share_usd"]
-                    if c in df.columns]
-            st.dataframe(df[cols], use_container_width=True, hide_index=True)
-
-            st.subheader("Net margin per share (after depth + fees), distinct arbs")
-            best: dict = {}
-            for r in hardened:
-                k = (r.get("station_id"), r.get("target_date"), r.get("threshold"))
-                v = r.get("net_margin_per_share_usd")
-                if v is None:
-                    continue
-                if k not in best or v > best[k]:
-                    best[k] = v
-            vals = sorted(best.values())
-            if vals:
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Distinct arbs", len(vals))
-                c2.metric("Median net/sh", f"${vals[len(vals)//2]:.3f}")
-                c3.metric("Max net/sh", f"${max(vals):.3f}")
-                c4.metric("Σ best net/sh", f"${sum(vals):.3f}")
-                st.caption("The pre-hardening empty-book fat tail (e.g. KMIA "
-                           "$0.735 gross) is filtered out — these are "
-                           "depth-fillable, net-of-fee margins only.")
-        else:
-            st.info("No depth-checked opportunities yet — the hardened daemon "
-                    "needs a refresh tick with live book depth to populate this.")
-    else:
-        st.info("No consistency-arb records yet. Strategy scans paired "
-                "(max, min) events at every 5-min refresh.")
-
-
-# Tab 6 — Publication window
-with tabs[6]:
     if pub_window:
         st.write(f"**{len(pub_window)}** publication-window snapshots.")
         df = pd.DataFrame([
@@ -481,8 +419,8 @@ with tabs[6]:
         )
 
 
-# Tab 7 — Portfolio
-with tabs[7]:
+# Tab 6 — Portfolio
+with tabs[6]:
     if isinstance(portfolio, dict) and portfolio.get("positions"):
         pos = portfolio["positions"]
         st.write(f"**{len(pos)}** synthetic positions (paper, dry_run=True).")
@@ -522,8 +460,8 @@ with tabs[7]:
         st.info("No positions in portfolio.json yet.")
 
 
-# Tab 8 — Logs
-with tabs[8]:
+# Tab 7 — Logs
+with tabs[7]:
     n_lines = st.slider("Lines to show", min_value=50, max_value=1000,
                         value=200, step=50)
     grep_filter = st.text_input("Filter (substring match)", value="")

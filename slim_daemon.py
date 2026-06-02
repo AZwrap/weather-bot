@@ -98,6 +98,13 @@ CONSENSUS_YES_ENABLED: bool = False
 # re-enables it without re-adding the calls.
 LAYER7_ENABLED: bool = False
 
+# Consistency arb DISABLED 2026-06-02 by operator request. After hardening
+# (REST depth + fees + empty-book/implausible-margin artifact filters), real
+# net-of-fee executable arbs ran at ~0 — the old headline was artifacts +
+# gross/top-of-book optimism. Call site gated on this flag; code + logs
+# retained, dashboard tab dropped. Flip True to re-enable.
+CONSISTENCY_ARB_ENABLED: bool = False
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -538,7 +545,7 @@ async def refresh_events_and_pollers(state: DaemonState) -> None:
     # Consistency arb — scans paired (max, min) events for
     # implementable arb (buy YES on both sides). Sync, run inline (cheap).
     try:
-        counts = await detect_and_execute_consistency_arb(
+        counts = CONSISTENCY_ARB_ENABLED and await detect_and_execute_consistency_arb(
             events=list(new_events_by_sk.values()),
             client=state.client,
             portfolio=state.portfolio,
@@ -1049,7 +1056,8 @@ async def main_async() -> int:
         f"events_refresh={args.events_refresh_interval}s  "
         f"layer7={'on' if LAYER7_ENABLED else 'OFF'}  "
         f"consensus_yes={'on' if CONSENSUS_YES_ENABLED else 'OFF'}  "
-        f"v2={'on' if V2_ENABLED else 'OFF'}"
+        f"v2={'on' if V2_ENABLED else 'OFF'}  "
+        f"consistency_arb={'on' if CONSISTENCY_ARB_ENABLED else 'OFF'}"
     )
 
     # Install signal handlers (UNIX). Windows skips silently.
