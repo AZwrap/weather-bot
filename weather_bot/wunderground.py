@@ -95,7 +95,7 @@ def _f_to_c(temp_f: float) -> float:
     return (float(temp_f) - 32.0) * 5.0 / 9.0
 
 
-def _parse_response(payload: dict[str, Any]) -> tuple[float | None, float | None, int, str | None]:
+def _parse_response(payload: dict[str, Any], station_unit: str = "F") -> tuple[float | None, float | None, int, str | None]:
     """Extract (daily_max_c, daily_min_c, n_obs, last_obs_iso_utc) from
     the api.weather.com historical observations JSON.
 
@@ -124,9 +124,19 @@ def _parse_response(payload: dict[str, Any]) -> tuple[float | None, float | None
         if t is None:
             continue
         try:
-            temps_c.append(_f_to_c(float(t)))
+            tv = float(t)
         except (TypeError, ValueError):
             continue
+        if station_unit == "C":
+            # Native fetch: units=m requested → `temp` is already °C (WUG's
+            # OWN rounded Celsius — exactly what Polymarket resolves on, no
+            # F→C conversion ambiguity). GUARD: a value too hot to be °C
+            # means the API silently ignored units=m and returned °F — convert
+            # defensively so a unit regression can't poison a hot-day resolve.
+            tv_c = _f_to_c(tv) if tv > 55.0 else tv
+        else:
+            tv_c = _f_to_c(tv)   # °F-native station (units=e) → convert to °C
+        temps_c.append(tv_c)
         try:
             vt = int(o.get("valid_time_gmt", 0))
             if vt > last_ts:
@@ -205,24 +215,28 @@ async def fetch_wunderground_daily(
     # all countries). Fall back to the legacy US-location form only if
     # the station isn't in the registry.
     lat = lon = None
+    station_unit = "F"
     try:
         from .locations import STATIONS_BY_ID
         st = STATIONS_BY_ID.get(icao.upper())
         if st is not None:
             lat, lon = st.latitude, st.longitude
+            station_unit = st.unit or "F"
     except Exception:
         pass
     if lat is not None and lon is not None:
         url = GEOCODE_ENDPOINT.format(lat=lat, lon=lon)
     else:
         url = LEGACY_ENDPOINT.format(icao=icao.upper())
+    # NATIVE-UNIT FETCH (2026-06-02): request each station in the unit
+    # Polymarket actually resolves it in — °C stations via units=m (WUG's own
+    # rounded Celsius, no F→C conversion ambiguity), US °F stations via
+    # units=e. Verified units=m is honored by api.weather.com. _parse_response
+    # guards against a silent unit regression on °C stations.
+    units_param = "m" if station_unit == "C" else "e"
     params = {
         "apiKey": api_key,
-        # Request Fahrenheit (the native ASOS / Wunderground unit) and
-        # convert to Celsius in _parse_response. See _parse_response's
-        # docstring for the rationale (audit boundary, fail-loud on any
-        # future API behavior change).
-        "units": "e",
+        "units": units_param,
         "startDate": ymd_compact,
         "endDate": ymd_compact,
     }
@@ -265,7 +279,7 @@ async def fetch_wunderground_daily(
         _cache[key] = rec
         return rec
 
-    daily_max, daily_min, n_obs, last_iso = _parse_response(payload)
+    daily_max, daily_min, n_obs, last_iso = _parse_response(payload, station_unit)
     rec = WundergroundDaily(
         icao=icao.upper(), target_date_iso=target_date.isoformat(),
         daily_max_c=daily_max, daily_min_c=daily_min,
