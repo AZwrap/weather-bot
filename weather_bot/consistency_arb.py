@@ -189,7 +189,7 @@ def _cumulative_yes_ask_lt_threshold(
     return total, n, used
 
 
-def detect_and_execute_consistency_arb(
+async def detect_and_execute_consistency_arb(
     *,
     events: list[Any],
     client: Any,
@@ -199,31 +199,55 @@ def detect_and_execute_consistency_arb(
     min_margin_usd: float = MIN_MARGIN_USD,
     shares_per_leg: int = SHARES_PER_LEG,
     book_cache: Any = None,
+    http: Any = None,
     log_path: Path = DEFAULT_LOG_PATH,
     verbose: bool = False,
 ) -> dict[str, int]:
     """Scan event list for max/min consistency arbs.
 
     Hardened (2026-06-02): a candidate that clears the cheap top-of-book
-    pre-filter is then re-priced against the REAL ask ladder
-    (`book_cache.get_depth`) for `shares_per_leg` shares on EVERY leg,
-    with taker fees subtracted. Any leg that can't supply the full share
-    count (empty/stale/thin book) fails the whole arb — this is the
-    artifact filter that kills empty-book sums masquerading as fat
-    margins. Only depth-checked, fee-netted survivors are written to the
-    log; the rejection funnel is returned in the counts dict.
+    pre-filter is then re-priced against the REAL ask ladder for
+    `shares_per_leg` shares on EVERY leg, with taker fees subtracted.
+    Depth source per leg: the fresh WS ladder (`book_cache.get_depth`)
+    when available, else a live REST orderbook fetch (`http`). This
+    matters — `price_change` deltas invalidate the WS ladder within
+    seconds, so REST is the reliable source for an accurate depth walk.
+    Any leg that can't supply the full share count (empty/thin book)
+    fails the whole arb — the artifact filter that kills empty-book sums
+    masquerading as fat margins. Only depth-checked, fee-netted survivors
+    are written to the log; the rejection funnel is in the counts dict.
 
-    With `book_cache=None` it falls back to the legacy top-of-book log
-    (depth_aware=False) so non-daemon callers/tests still work."""
+    With neither `book_cache` nor `http` it falls back to the legacy
+    top-of-book log (depth_aware=False) so tests/callers still work."""
     from weather_bot.fees import taker_fee_usd
     from weather_bot.locations import STATIONS_BY_ID
     from weather_bot.polymarket import (
-        event_target_date, match_event_to_station, parse_bucket,
+        event_target_date, fetch_orderbook_depth, match_event_to_station,
+        parse_bucket,
     )
     counts: dict[str, int] = defaultdict(int)
     counts["placed"] = 0
 
     now_utc = datetime.now(timezone.utc)
+
+    # Per-call depth memo: each YES token fetched at most once per refresh.
+    # Cache-first (free when the WS ladder is fresh), REST-fallback (the
+    # WS ladder is book_invalidated most of the time on active markets).
+    _depth_memo: dict[str, Any] = {}
+
+    async def _leg_depth(tok: Any) -> Any:
+        if not tok:
+            return None
+        if tok in _depth_memo:
+            return _depth_memo[tok]
+        d = book_cache.get_depth(tok) if book_cache is not None else None
+        if d is None and http is not None:
+            try:
+                d = await fetch_orderbook_depth(tok, http)
+            except Exception:
+                d = None
+        _depth_memo[tok] = d
+        return d
 
     # Group by (station, target_date) → {max: ev, min: ev}
     pairs: dict[tuple[str, str], dict[str, Any]] = {}
@@ -290,8 +314,8 @@ def detect_and_execute_consistency_arb(
 
             legs = list(max_buckets) + list(min_buckets)
 
-            # No depth source → legacy top-of-book log (non-daemon callers).
-            if book_cache is None:
+            # No depth source at all → legacy top-of-book log (tests).
+            if book_cache is None and http is None:
                 counts["opportunities"] += 1
                 counts["placed"] += 1
                 _log_event({
@@ -322,9 +346,9 @@ def detect_and_execute_consistency_arb(
             reject = None
             for m in legs:
                 tok = getattr(m, "yes_token_id", None)
-                depth = book_cache.get_depth(tok) if tok else None
+                depth = await _leg_depth(tok)
                 if depth is None:
-                    reject = "no_depth"      # cache miss / stale / empty book
+                    reject = "no_depth"      # no orderbook / empty book (real)
                     break
                 fr = _fill_shares(depth, S)
                 if fr is None or fr[1] < S - 1e-9:

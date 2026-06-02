@@ -538,12 +538,13 @@ async def refresh_events_and_pollers(state: DaemonState) -> None:
     # Consistency arb — scans paired (max, min) events for
     # implementable arb (buy YES on both sides). Sync, run inline (cheap).
     try:
-        counts = detect_and_execute_consistency_arb(
+        counts = await detect_and_execute_consistency_arb(
             events=list(new_events_by_sk.values()),
             client=state.client,
             portfolio=state.portfolio,
             portfolio_path=state.args.portfolio_path,
             book_cache=state.book_cache,
+            http=state.http,
         )
         rej = {k: v for k, v in (counts or {}).items() if k.startswith("rej_")}
         if counts and (counts.get("placed", 0) > 0 or sum(rej.values()) > 0):
