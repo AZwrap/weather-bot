@@ -113,8 +113,15 @@ def sell_proceeds(shares, bid):
     return shares * bid - taker_fee_usd(shares, bid)
 
 
-def simulate_event(rows, resmap):
-    """Return (static_pnl, roll_pnl, n_flips) for one event, or None."""
+def simulate_event(rows, resmap, obs_confirmed=False):
+    """Return (static_pnl, roll_pnl, n_flips) for one event, or None.
+
+    obs_confirmed=True models the operator's actual idea: only roll OUT of a
+    bucket the observed max has genuinely passed (the favorite is dead). We
+    proxy "obs would have confirmed death" with perfect foresight — skip the
+    roll if the currently-held YES bucket is the eventual WUG winner. This is
+    an upper bound on the no-whipsaw benefit (perfect death-detection, but
+    still REAL collapsed-bid exits) and it never rolls a would-be winner."""
     rows = sorted(rows, key=lambda r: r.get("ts_utc") or "")
     # fire = first snapshot whose leader reached the trigger and has a winner
     fire = None
@@ -153,6 +160,11 @@ def simulate_event(rows, resmap):
         new_label = r["winner"]["bucket_label"]
         if new_label == cur or float(r.get("leader_yes_ask", 0)) < TRIGGER:
             continue
+        # obs-confirmed: don't roll out of a bucket that ultimately WINS —
+        # the observed max would never have passed it, so no death signal.
+        if obs_confirmed and cur in held and held[cur]["side"] == "YES" \
+                and leg_won(held[cur], actual_int, unit):
+            continue
         # ---- ROLL  cur -> new_label ----
         fade_by = {l["bucket_label"]: l for l in r.get("fade_no", [])}
         # 1) sell held YES-cur at its real top-of-book bid (= 1 - NO-cur ask)
@@ -178,6 +190,9 @@ def simulate_event(rows, resmap):
     return static_pnl, roll_pnl, n_flips
 
 
+EXCLUDED = {"LTFM", "LLBG", "UUWW", "VHHH", "DNMM"}  # now untradeable (dodgy source)
+
+
 def main():
     rows = load_jsonl(SWEEP)
     resmap = resolution_map()
@@ -185,47 +200,47 @@ def main():
     for r in rows:
         by_ev[(r.get("station_id"), r.get("target"), r.get("target_date"))].append(r)
 
-    per_station = defaultdict(lambda: {"n": 0, "flips": 0, "static": 0.0, "roll": 0.0, "helped": 0, "hurt": 0})
-    tot = {"n": 0, "flips": 0, "static": 0.0, "roll": 0.0, "helped": 0, "hurt": 0}
-    flip_detail = []
+    # accumulators: [all, clean] x [static, mkt-roll, obs-roll]
+    agg = {scope: {"static": 0.0, "mkt": 0.0, "obs": 0.0, "n": 0, "flips": 0}
+           for scope in ("all", "clean")}
+    detail = []
     for (sid, tgt, date), evrows in by_ev.items():
-        res = simulate_event(evrows, resmap)
-        if res is None:
+        rm = simulate_event(evrows, resmap, obs_confirmed=False)
+        ro = simulate_event(evrows, resmap, obs_confirmed=True)
+        if rm is None or ro is None:
             continue
-        static_pnl, roll_pnl, n_flips = res
-        s = per_station[sid]
-        for d in (s, tot):
-            d["n"] += 1; d["flips"] += n_flips
-            d["static"] += static_pnl; d["roll"] += roll_pnl
+        static_pnl, mkt_pnl, n_flips = rm
+        _, obs_pnl, _ = ro
+        scopes = ["all"] + (["clean"] if sid not in EXCLUDED else [])
+        for sc in scopes:
+            a = agg[sc]
+            a["static"] += static_pnl; a["mkt"] += mkt_pnl; a["obs"] += obs_pnl
+            a["n"] += 1; a["flips"] += n_flips
         if n_flips > 0:
-            delta = roll_pnl - static_pnl
-            if delta > 0.01:
-                s["helped"] += 1; tot["helped"] += 1
-            elif delta < -0.01:
-                s["hurt"] += 1; tot["hurt"] += 1
-            flip_detail.append((sid, tgt, date, static_pnl, roll_pnl, delta, n_flips))
+            detail.append((sid, tgt, date, static_pnl, mkt_pnl, obs_pnl, n_flips))
 
-    print("=" * 78)
-    print("ROLL-REALISTIC — static fire-once vs roll-on-flip with REAL collapsed-bid exits")
-    print("(trigger=%.2f, sells at real top-of-book bid, fees both sides, WUG resolution)" % TRIGGER)
-    print("=" * 78)
-    print("scored events: %d   flipped: %d   roll helped: %d  hurt: %d" % (
-        tot["n"], len(flip_detail), tot["helped"], tot["hurt"]))
+    print("=" * 84)
+    print("ROLL-REALISTIC — REAL collapsed-bid exits, taker fees both sides, WUG resolution")
+    print("  static     = fire once, hold to resolution")
+    print("  mkt-roll   = roll on every market leader-flip (whipsaw-prone)")
+    print("  obs-roll   = roll ONLY when the held favorite is genuinely dead (operator's idea;")
+    print("               perfect death-detection upper bound, no whipsaw)")
+    print("  reference  : analyze_roll_shadow upper bound (cheap exits) = +$143.72")
+    print("=" * 84)
+    for sc in ("all", "clean"):
+        a = agg[sc]
+        lbl = "ALL STATIONS" if sc == "all" else "CLEAN (tradeable; excl Moscow/Istanbul/etc.)"
+        print("\n%s — %d events, %d flips" % (lbl, a["n"], a["flips"]))
+        print("  static   $%+8.2f" % a["static"])
+        print("  mkt-roll $%+8.2f   Δ $%+7.2f" % (a["mkt"], a["mkt"] - a["static"]))
+        print("  obs-roll $%+8.2f   Δ $%+7.2f   (+$%.2f vs mkt-roll: whipsaw avoided)"
+              % (a["obs"], a["obs"] - a["static"], a["obs"] - a["mkt"]))
     print()
-    print("OVERALL")
-    print("  static = $%+8.2f   roll = $%+8.2f   Δ = $%+8.2f" % (tot["static"], tot["roll"], tot["roll"] - tot["static"]))
-    print()
-    print("FLIPPED EVENTS (the only ones the roll touches)")
-    for sid, tgt, date, st, rl, dl, nf in sorted(flip_detail, key=lambda x: x[5]):
-        print("  %-5s %-3s %s  static $%+7.2f -> roll $%+7.2f  Δ $%+7.2f  (%d flip)" % (sid, tgt, date, st, rl, dl, nf))
-    print()
-    print("PER-STATION (only stations with a flip shown)")
-    for sid in sorted(per_station, key=lambda x: (per_station[x]["roll"] - per_station[x]["static"])):
-        s = per_station[sid]
-        if s["flips"] == 0:
-            continue
-        print("  %-5s n=%2d flips=%d  static $%+7.2f -> roll $%+7.2f  Δ $%+7.2f  (helped %d/hurt %d)" % (
-            sid, s["n"], s["flips"], s["static"], s["roll"], s["roll"] - s["static"], s["helped"], s["hurt"]))
+    print("FLIPPED EVENTS  (static -> mkt-roll / obs-roll)")
+    for sid, tgt, date, st, mk, ob, nf in sorted(detail, key=lambda x: x[5] - x[3]):
+        flag = "  <excluded>" if sid in EXCLUDED else ""
+        print("  %-5s %-3s %s  $%+7.2f -> mkt $%+7.2f / obs $%+7.2f  (%d flip)%s"
+              % (sid, tgt, date, st, mk, ob, nf, flag))
 
 
 if __name__ == "__main__":
