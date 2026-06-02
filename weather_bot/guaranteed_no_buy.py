@@ -38,7 +38,9 @@ Key properties (vs Layer 5 paper-log entry filter):
 
 Confirmation log (data/guaranteed_no_buy_log.jsonl):
   Per fill: timestamp, station, bucket, ask, fill_price, shares,
-  expected_payout. After 3 days of data we measure actual fill-to-
+  expected_payout, entry_fee_usd, expected_gross_pnl_usd,
+  expected_net_pnl_usd (gross − taker fee, strictly net-of-fee like
+  consensus_basket). After 3 days of data we measure actual fill-to-
   redeem rate; if ≥98% redeem successfully, the cap stays at $0.98
   and the layer is fully validated.
 
@@ -60,6 +62,7 @@ from zoneinfo import ZoneInfo
 
 from .alerts import record_alert
 from .exclusions import load_active_exclusions
+from .fees import taker_fee_usd
 from .locations import STATIONS_BY_ID
 from .obs_distance_filter import bucket_edges_c
 from .polymarket import parse_bucket
@@ -911,6 +914,9 @@ def detect_and_execute_guaranteed_buys(
                 "fill_price": fill_price,
                 "filled_shares": filled_shares,
                 "unfilled_refunded_usd": unfilled_near_zero,
+                "entry_fee_usd": taker_fee_usd(filled_shares, fill_price),
+                "expected_net_pnl_usd": filled_shares * (1.0 - fill_price)
+                - taker_fee_usd(filled_shares, fill_price),
                 "order_id": result.order_id,
                 "result": "near_zero_fill_recorded",
             }, log_path)
@@ -1009,6 +1015,15 @@ def detect_and_execute_guaranteed_buys(
             "partial_fill": unfilled_usd > 0.10,
             "expected_payout_usd": filled_shares,  # NO redeems at $1 per share
             "expected_gross_pnl_usd": filled_shares * (1.0 - fill_price),
+            # Net-of-fee paper P&L (matches consensus_basket scoring).
+            # Taker fee = shares × 0.05 × p × (1-p) via the canonical
+            # weather_bot.fees model. entry_fee_usd is subtracted from
+            # BOTH the win leg (net win) and the loss leg (cost + fee),
+            # so any downstream resolver that scores this log is strictly
+            # net-of-fee. Tiny at Layer 7's $0.95-$0.98 regime (~0.1-0.25%).
+            "entry_fee_usd": taker_fee_usd(filled_shares, fill_price),
+            "expected_net_pnl_usd": filled_shares * (1.0 - fill_price)
+            - taker_fee_usd(filled_shares, fill_price),
             "cap_price": hard_cap_price,
             "order_id": result.order_id,
             "fast_path": used_presigned,  # True if broadcast pre-signed (saves ~200ms)
