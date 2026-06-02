@@ -69,6 +69,15 @@ MAX_PLAUSIBLE_LEGS: int = 40
 """Defensive cap. A 'guaranteed' arb spanning more than this many legs
 is almost always an empty-book sum, not a real lock."""
 
+MAX_PLAUSIBLE_NET_MARGIN: float = 0.15
+"""Reject 'guaranteed' arbs whose net margin/share exceeds this. In any
+functioning market a cross-event lock is sub-few-percent — a fat one
+would be taken instantly. A large margin means the near-certain leg is
+dust-priced: a stale/dead book, not real money. Canonical example: KMIA
+T=76 (Miami summer, max≥76 is near-certain yet the book shows ~2¢ asks →
+a 70% 'margin'). The 5-share depth filter alone passes these because the
+dead book still has a few shares of dust; this cap is what kills them."""
+
 
 def _now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -375,6 +384,13 @@ async def detect_and_execute_consistency_arb(
             # fees is not worth executing.
             if net_per_share < min_margin_usd:
                 counts["rej_thin_net"] += 1
+                continue
+            # Artifact filter #2 — too-good-to-be-real. A guaranteed lock
+            # this fat means a near-certain leg is dust-priced (dead/stale
+            # book), not executable money. Kills the KMIA-T=76 class that
+            # survives the 5-share depth check on a few cents of dust.
+            if net_per_share > MAX_PLAUSIBLE_NET_MARGIN:
+                counts["rej_implausible"] += 1
                 continue
 
             counts["opportunities"] += 1
