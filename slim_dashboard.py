@@ -1,499 +1,619 @@
-"""Streamlit dashboard for the slim_daemon.
+#!/usr/bin/env python3
+"""Weather Bot — custom dark dashboard (lite rebuild).
 
-Run on the VPS under systemd (deploy/slim-dashboard.service) or
-directly for local development:
+A dependency-free stdlib HTTP server (no Streamlit). Serves:
+  GET /          → the dark, tabbed, auto-refreshing HTML page
+  GET /api/data  → the JSON the page renders from
 
-    streamlit run slim_dashboard.py
+Hero = Positions + P&L. Net-of-fee P&L is computed by joining each live
+strategy's fill log against forward_log resolutions with the canonical
+scorers (weather_bot.pnl._rounded_observation + bucket_won) and the
+weather_bot.fees taker-fee model — the same maths the analyzers use.
 
-Access from your laptop / WSL via SSH tunnel:
-
-    ssh -L 8501:localhost:8501 weather-vps2
-    # then open http://localhost:8501 in your Windows browser
-
-Read-only. Never mutates portfolio.json or any log file.
+Runs as the slim-dashboard systemd service:
+  ExecStart=/root/Weather_Bot/.venv/bin/python /root/Weather_Bot/slim_dashboard.py
+Binds 127.0.0.1:8501 (reach it via SSH tunnel, same as before).
 """
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import time
-from collections import Counter
+from collections import defaultdict
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
 
-import pandas as pd
-import streamlit as st
+from weather_bot.fees import taker_fee_usd
+from weather_bot.locations import STATIONS_BY_ID
+from weather_bot.pnl import _rounded_observation, bucket_won
 
 DATA = Path("data")
+HOST = "127.0.0.1"
+PORT = 8501
+REFRESH_S = 20  # client auto-refresh cadence
 
-LOGS = {
-    "intraday": DATA / "intraday_log.jsonl",
-    "layer7": DATA / "guaranteed_no_buy_log.jsonl",
-    "layer7_margin_filtered": DATA / "margin_filter_log.jsonl",
-    "v2": DATA / "v2_conditional_log.jsonl",
-    "hbn": DATA / "high_bucket_no_log.jsonl",
-    "persistence_tail": DATA / "persistence_tail_log.jsonl",
-    "consistency_arb": DATA / "consistency_arb_log.jsonl",
-    "consensus_yes": DATA / "consensus_yes_log.jsonl",
-    "consensus_yes_exit": DATA / "consensus_yes_exit_log.jsonl",
-    "consensus_basket": DATA / "consensus_basket_log.jsonl",
-    "forward_log": DATA / "forward_log.jsonl",
-    "publication_window": DATA / "publication_window_log.jsonl",
-    "portfolio_audit": DATA / "portfolio_save_audit.jsonl",
+# Live strategies (the only ones that still fire). Each maps to its fill log
+# and the side it bets. consensus_basket carries an explicit per-leg side.
+STRATEGIES = {
+    "consensus_basket": {"log": "consensus_basket_log.jsonl", "side": None,  "label": "Consensus basket"},
+    "high_bucket_no":   {"log": "high_bucket_no_log.jsonl",   "side": "NO",  "label": "High-bucket NO"},
+    "persistence_tail": {"log": "persistence_tail_log.jsonl", "side": "NO",  "label": "Persistence tail"},
 }
 
-PORTFOLIO_PATH = DATA / "portfolio.json"
-FEE_CACHE_PATH = DATA / "fee_config_cache.json"
-EXCLUSIONS_PATH = DATA / "excluded_stations.json"
 
-st.set_page_config(
-    page_title="Weather Bot Dashboard",
-    page_icon="🌤️",
-    layout="wide",
-)
+# ─────────────────────────────────────────── loaders
 
-
-# ── Helpers ─────────────────────────────────────────────────────────
-
-@st.cache_data(ttl=15)
-def load_jsonl(path_str: str) -> list[dict]:
-    p = Path(path_str)
-    if not p.exists():
-        return []
+def load_jsonl(path: Path) -> list[dict]:
     out: list[dict] = []
-    with p.open("r", encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                out.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
+    if not path.exists():
+        return out
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    out.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except OSError:
+        pass
     return out
 
 
-@st.cache_data(ttl=15)
-def load_json(path_str: str) -> dict | None:
-    p = Path(path_str)
-    if not p.exists():
+def load_json(path: Path):
+    if not path.exists():
         return None
     try:
-        return json.loads(p.read_text(encoding="utf-8"))
+        return json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return None
 
 
-@st.cache_data(ttl=15)
-def systemd_status(service: str) -> dict[str, str]:
-    """Read systemd state via systemctl show. Returns a flat dict of
-    Property=Value pairs we care about."""
+def _unit(sid: str) -> str:
+    s = STATIONS_BY_ID.get(sid)
+    return (getattr(s, "unit", None) or "C")
+
+
+# ─────────────────────────────────────────── caches (slow calls)
+
+_cache: dict = {"sys": (0.0, None), "journal": (0.0, None)}
+
+
+def _cached(key: str, ttl: float, fn):
+    now = time.time()
+    ts, val = _cache.get(key, (0.0, None))
+    if val is not None and (now - ts) < ttl:
+        return val
+    val = fn()
+    _cache[key] = (now, val)
+    return val
+
+
+def systemd_show(service: str) -> dict:
+    def go():
+        try:
+            r = subprocess.run(
+                ["systemctl", "show", service,
+                 "--property=ActiveState,SubState,ExecMainStartTimestamp,NRestarts,MemoryCurrent"],
+                capture_output=True, text=True, timeout=5,
+            )
+            d = {}
+            for ln in r.stdout.splitlines():
+                if "=" in ln:
+                    k, v = ln.split("=", 1)
+                    d[k] = v
+            return d
+        except Exception:
+            return {}
+    return _cached(f"sys:{service}", 8.0, go)
+
+
+def journal_tail(service: str, n: int = 250) -> list[str]:
+    def go():
+        try:
+            r = subprocess.run(
+                ["journalctl", "-u", service, "-n", str(n), "--no-pager", "-o", "short-iso"],
+                capture_output=True, text=True, timeout=6,
+            )
+            return r.stdout.splitlines()
+        except Exception:
+            return []
+    return _cached(f"jrnl:{service}", 8.0, go)
+
+
+def read_flags() -> dict:
+    """Parse strategy enable flags from source (no heavy import)."""
+    flags = {"paper_only": True}
     try:
-        r = subprocess.run(
-            ["systemctl", "show", service,
-             "--property=ActiveState,SubState,MainPID,MemoryCurrent,ExecMainStartTimestamp,NRestarts"],
-            capture_output=True, text=True, timeout=5,
-        )
-        out: dict[str, str] = {}
-        for line in r.stdout.splitlines():
-            if "=" in line:
-                k, v = line.split("=", 1)
-                out[k] = v
-        return out
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-        return {}
-
-
-@st.cache_data(ttl=15)
-def recent_journal(service: str, lines: int = 200) -> list[str]:
+        src = Path("slim_daemon.py").read_text(encoding="utf-8")
+        for name, key in [("PAPER_ONLY", "paper_only"), ("LAYER7_ENABLED", "layer7"),
+                          ("CONSENSUS_YES_ENABLED", "consensus_yes"),
+                          ("CONSISTENCY_ARB_ENABLED", "consistency_arb")]:
+            m = re.search(rf"^{name}: bool = (True|False)", src, re.M)
+            if m:
+                flags[key] = (m.group(1) == "True")
+    except OSError:
+        pass
     try:
-        r = subprocess.run(
-            ["journalctl", "-u", service, "-n", str(lines),
-             "--no-pager", "-o", "short-iso"],
-            capture_output=True, text=True, timeout=10,
-        )
-        return r.stdout.splitlines()
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-        return []
+        v = Path("weather_bot/v2_conditional_preposit.py").read_text(encoding="utf-8")
+        m = re.search(r"^V2_ENABLED: bool = (True|False)", v, re.M)
+        if m:
+            flags["v2"] = (m.group(1) == "True")
+    except OSError:
+        pass
+    return flags
 
 
-def fmt_age(iso: str | None) -> str:
-    if not iso:
-        return "—"
+# ─────────────────────────────────────────── P&L engine
+
+def resolution_map() -> dict:
+    """(station, target, date) → actual_obs_c, from forward_log."""
+    out: dict = {}
+    for r in load_jsonl(DATA / "forward_log.jsonl"):
+        if r.get("actual_obs_c") is None:
+            continue
+        k = (r.get("station_id"), r.get("target"), r.get("target_date"))
+        if all(k):
+            out[k] = float(r["actual_obs_c"])
+    return out
+
+
+def _score(sid, target, date, kind, thr, side, shares, fill, resmap):
+    """Net-of-fee P&L for one filled leg. status open|resolved."""
+    cost = float(shares) * float(fill)
+    fee = taker_fee_usd(float(shares), float(fill))
+    actual_c = resmap.get((sid, target, date))
+    if actual_c is None or kind is None or thr is None:
+        return {"status": "open", "net": None, "cost": cost, "fee": fee, "won": None}
+    unit = _unit(sid)
     try:
-        t = datetime.fromisoformat(iso.replace("Z", "+00:00"))
-        if t.tzinfo is None:
-            t = t.replace(tzinfo=timezone.utc)
-        age_s = (datetime.now(timezone.utc) - t).total_seconds()
-        if age_s < 60:
-            return f"{age_s:.0f}s"
-        if age_s < 3600:
-            return f"{age_s/60:.1f}m"
-        if age_s < 86400:
-            return f"{age_s/3600:.1f}h"
-        return f"{age_s/86400:.1f}d"
-    except (ValueError, TypeError):
-        return "—"
+        actual_int = _rounded_observation(actual_c, unit)
+        bwon = bucket_won(kind, int(thr), actual_int, unit)
+    except Exception:
+        return {"status": "open", "net": None, "cost": cost, "fee": fee, "won": None}
+    side_won = bwon if side == "YES" else (not bwon)
+    payout = float(shares) if side_won else 0.0
+    return {"status": "resolved", "net": payout - cost - fee, "cost": cost,
+            "fee": fee, "won": side_won, "actual_int": actual_int}
 
 
-def fmt_mem(bytes_str: str) -> str:
-    try:
-        b = int(bytes_str)
-        if b < 1024**2:
-            return f"{b/1024:.1f} KB"
-        if b < 1024**3:
-            return f"{b/1024**2:.0f} MB"
-        return f"{b/1024**3:.2f} GB"
-    except (ValueError, TypeError):
-        return "—"
-
-
-# ── Sidebar controls ────────────────────────────────────────────────
-st.sidebar.title("🌤️ Weather Bot")
-st.sidebar.caption(f"Now: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC")
-auto_refresh = st.sidebar.toggle("Auto-refresh (30s)", value=True)
-if st.sidebar.button("Force refresh"):
-    st.cache_data.clear()
-    st.rerun()
-
-st.sidebar.divider()
-st.sidebar.subheader("Quick commands")
-st.sidebar.code(
-    "sudo systemctl restart slim-daemon\n"
-    "sudo journalctl -u slim-daemon -f\n"
-    "touch ~/Weather_Bot/KILL_SWITCH",
-    language="bash",
-)
-
-# ── Top status bar ──────────────────────────────────────────────────
-daemon = systemd_status("slim-daemon.service")
-portfolio = load_json(str(PORTFOLIO_PATH)) or {}
-intraday = load_jsonl(str(LOGS["intraday"]))
-layer7 = load_jsonl(str(LOGS["layer7"]))
-v2 = load_jsonl(str(LOGS["v2"]))
-hbn = load_jsonl(str(LOGS["hbn"]))
-pers_tail = load_jsonl(str(LOGS["persistence_tail"]))
-cons_arb = load_jsonl(str(LOGS["consistency_arb"]))
-cons_yes = load_jsonl(str(LOGS["consensus_yes"]))
-cons_yes_exit = load_jsonl(str(LOGS["consensus_yes_exit"]))
-basket = load_jsonl(str(LOGS["consensus_basket"]))
-forward_log = load_jsonl(str(LOGS["forward_log"]))
-pub_window = load_jsonl(str(LOGS["publication_window"]))
-audit = load_jsonl(str(LOGS["portfolio_audit"]))
-
-active_state = daemon.get("ActiveState", "?")
-sub_state = daemon.get("SubState", "?")
-status_color = "🟢" if active_state == "active" else "🔴"
-
-last_audit_ts = audit[-1].get("ts_utc") if audit else None
-
-st.title("Weather Bot — Live Dashboard")
-top = st.columns(6)
-top[0].metric(
-    "Daemon",
-    f"{status_color} {active_state}",
-    f"{sub_state}, restarts: {daemon.get('NRestarts', '?')}",
-)
-top[1].metric("Memory", fmt_mem(daemon.get("MemoryCurrent", "")))
-top[2].metric(
-    "Uptime since",
-    daemon.get("ExecMainStartTimestamp", "—")[:19] or "—",
-)
-top[3].metric(
-    "Last save",
-    fmt_age(last_audit_ts) + " ago" if last_audit_ts else "—",
-)
-
-positions = portfolio.get("positions", []) if isinstance(portfolio, dict) else []
-total_fires_today = sum(
-    1 for r in intraday + layer7 + v2 + hbn + pers_tail + cons_arb + cons_yes
-    if (r.get("result") in ("filled", "opportunity") or r.get("decision") in ("placed", "BUY_EARLY_TAIL"))
-    and (r.get("ts_utc") or r.get("scan_time_utc") or "").startswith(
-        datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    )
-)
-top[4].metric("Synthetic positions", len(positions))
-top[5].metric("Strategy fires today", total_fires_today)
-
-
-# ── Tabs ────────────────────────────────────────────────────────────
-tabs = st.tabs([
-    "Strategy fires",     # 0
-    "WUG / lock-in",      # 1
-    "Consensus basket",   # 2
-    "High-bucket NO",     # 3
-    "Persistence tail",   # 4
-    "Publication window", # 5
-    "Portfolio",          # 6
-    "Logs",               # 7
-])
-
-# Tab 0 — Combined strategy fires
-with tabs[0]:
+def compute_positions(resmap) -> list[dict]:
+    """One row per filled leg across the 3 live strategies (deduped)."""
     rows: list[dict] = []
-    for r in intraday:
-        if r.get("decision") == "BUY_EARLY_TAIL":
+    seen = set()
+    for strat, cfg in STRATEGIES.items():
+        for r in load_jsonl(DATA / cfg["log"]):
+            if r.get("result") != "filled":
+                continue
+            side = r.get("side") or cfg["side"] or "NO"
+            sid = r.get("station_id"); target = r.get("target"); date = r.get("target_date")
+            kind = r.get("bucket_kind"); thr = r.get("bucket_threshold")
+            shares = r.get("shares"); fill = r.get("fill_price")
+            if shares is None or fill is None:
+                continue
+            key = (strat, sid, target, date, kind, thr, side)
+            if key in seen:
+                continue
+            seen.add(key)
+            sc = _score(sid, target, date, kind, thr, side, shares, fill, resmap)
             rows.append({
-                "strategy": "lock-in YES",
-                "ts": r.get("scan_time_utc"),
-                "station": r.get("station_id"),
-                "target": r.get("target"),
-                "date": r.get("target_date"),
-                "bucket": f"{r.get('winning_bucket_kind')}/{r.get('winning_bucket_threshold')}",
-                "size_usd": None,
-                "reason": (r.get("reason") or "")[:60],
+                "strategy": strat, "station": sid, "target": target, "date": date,
+                "bucket": r.get("bucket_label"), "side": side,
+                "shares": round(float(shares), 2), "fill": round(float(fill), 4),
+                "ts": r.get("ts_utc"), "depth": r.get("depth_source"),
+                **{k: (round(v, 4) if isinstance(v, float) else v) for k, v in sc.items()},
             })
-    for r in basket:
-        # One basket = one winner (YES) leg; NO fade legs aren't separate fires.
-        if r.get("result") == "filled" and r.get("side") == "YES":
-            rows.append({
-                "strategy": "consensus basket",
-                "ts": r.get("ts_utc"),
-                "station": r.get("station_id"),
-                "target": r.get("target") or "—",
-                "date": r.get("target_date"),
-                "bucket": r.get("bucket_label"),
-                "size_usd": r.get("size_usd"),
-                "reason": f"winner @ ${(r.get('fill_price') or 0):.3f}",
-            })
-    for r in hbn:
-        if r.get("result") == "filled":
-            rows.append({
-                "strategy": "high-bucket NO",
-                "ts": r.get("ts_utc"),
-                "station": r.get("station_id"),
-                "target": r.get("target"),
-                "date": r.get("target_date"),
-                "bucket": r.get("bucket_label"),
-                "size_usd": r.get("size_usd"),
-                "reason": f"no_ask=${r.get('no_ask_snapshot') or r.get('no_ask') or 0:.3f}",
-            })
-    for r in pers_tail:
-        if r.get("result") == "filled":
-            rows.append({
-                "strategy": "persistence tail",
-                "ts": r.get("ts_utc"),
-                "station": r.get("station_id"),
-                "target": r.get("target"),
-                "date": r.get("target_date"),
-                "bucket": r.get("bucket_label"),
-                "size_usd": r.get("size_usd"),
-                "reason": f"prior={r.get('prior_c'):.1f}°C, dist={r.get('distance_buckets')}b",
-            })
-    if rows:
-        df = pd.DataFrame(rows).sort_values("ts", ascending=False)
-        st.write(f"**{len(df)} fires** across all strategies (paper)")
-        st.dataframe(df, use_container_width=True, hide_index=True)
-        counts = df["strategy"].value_counts().reset_index()
-        counts.columns = ["strategy", "fires"]
-        st.bar_chart(counts.set_index("strategy"))
-    else:
-        st.info("No strategy fires yet. Daemon just started or no qualifying events.")
+    rows.sort(key=lambda x: x.get("ts") or "", reverse=True)
+    return rows
 
 
-# Tab 1 — WUG + lock-in
-with tabs[1]:
-    st.subheader("Lock-in YES decisions (WUG primary, METAR fallback)")
-    if intraday:
-        df = pd.DataFrame(intraday).sort_values("scan_time_utc", ascending=False).head(50)
-        cols = [c for c in ["scan_time_utc", "station_id", "target", "target_date",
-                            "decision", "extreme_so_far_c",
-                            "winning_bucket_kind", "winning_bucket_threshold",
-                            "reason", "n_observations_used"]
-                if c in df.columns]
-        st.dataframe(df[cols], use_container_width=True, hide_index=True)
+def compute(resmap=None) -> dict:
+    resmap = resmap if resmap is not None else resolution_map()
+    positions = compute_positions(resmap)
+    today = datetime.now(timezone.utc).date().isoformat()
 
-        st.subheader("Decision counts")
-        counts = Counter(r.get("decision") for r in intraday)
-        st.write(dict(counts))
-    else:
-        st.info("No intraday decisions logged yet.")
+    by_strat: dict = {}
+    by_day: dict = defaultdict(float)
+    tot_net = 0.0; tot_open_exp = 0.0; n_open = 0; n_res = 0; wins = 0; losses = 0; today_net = 0.0
+    for p in positions:
+        s = by_strat.setdefault(p["strategy"], {
+            "strategy": p["strategy"], "label": STRATEGIES.get(p["strategy"], {}).get("label", p["strategy"]),
+            "net": 0.0, "resolved": 0, "wins": 0, "open": 0, "open_exposure": 0.0})
+        if p["status"] == "resolved":
+            s["net"] += p["net"]; s["resolved"] += 1
+            tot_net += p["net"]; n_res += 1
+            by_day[p["date"]] += p["net"]
+            if p["date"] == today:
+                today_net += p["net"]
+            if p["won"]:
+                s["wins"] += 1; wins += 1
+            else:
+                losses += 1
+        else:
+            s["open"] += 1; s["open_exposure"] += p["cost"]
+            n_open += 1; tot_open_exp += p["cost"]
+    for s in by_strat.values():
+        s["net"] = round(s["net"], 2)
+        s["open_exposure"] = round(s["open_exposure"], 2)
+        s["win_rate"] = round(s["wins"] / s["resolved"], 3) if s["resolved"] else None
 
+    days = sorted(by_day.items())[-14:]
 
-# Tab 2 — Consensus basket
-with tabs[2]:
-    st.caption("On a bucket's YES crossing the trigger (0.85): BUY YES on that "
-               "winner + BUY NO on every other bucket (FAK taker), hold to "
-               "resolution. Locks on a FILLABLE winner, not the first cross.")
-    if basket:
-        fills = [r for r in basket if r.get("result") == "filled"]
-        winners = [r for r in fills if r.get("side") == "YES"]
-        no_legs = [r for r in fills if r.get("side") == "NO"]
-        deployed = sum((r.get("size_usd") or 0) for r in fills)
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Baskets (winner legs)", len(winners))
-        c2.metric("NO fade legs", len(no_legs))
-        c3.metric("Total legs filled", len(fills))
-        c4.metric("Deployed (paper)", f"${deployed:.2f}")
+    # activity feed (recent fills, any field set)
+    activity = [{
+        "ts": p["ts"], "strategy": p["strategy"], "station": p["station"],
+        "target": p["target"], "date": p["date"], "bucket": p["bucket"],
+        "side": p["side"], "shares": p["shares"], "fill": p["fill"],
+        "status": p["status"], "net": p["net"],
+    } for p in positions[:60]]
 
-        st.subheader("Recent leg fills (last 80)")
-        df = pd.DataFrame(fills).sort_values("ts_utc", ascending=False).head(80)
-        cols = [c for c in ["ts_utc", "side", "station_id", "target", "target_date",
-                            "bucket_label", "bucket_kind", "bucket_threshold",
-                            "limit", "fill_price", "shares", "size_usd",
-                            "depth_source"]
-                if c in df.columns]
-        st.dataframe(df[cols], use_container_width=True, hide_index=True)
-
-        st.caption("Net-of-fee P&L is scored offline by analyze_consensus_basket.py "
-                   "(winner redeems at $1, fade legs expire worthless) — not live here.")
-    else:
-        st.info("No consensus-basket fires yet. Fires when a bucket's YES crosses "
-                "the trigger (0.85) with fillable depth.")
-
-
-# Tab 3 — High-bucket NO
-with tabs[3]:
-    if hbn:
-        st.write(f"**{len(hbn)}** high-bucket NO log entries.")
-        df = pd.DataFrame(hbn).sort_values("ts_utc", ascending=False).head(50)
-        cols = [c for c in ["ts_utc", "result", "station_id", "target", "target_date",
-                            "bucket_label",
-                            "no_ask_snapshot", "submitted_limit", "fill_price",
-                            "no_ask_source",
-                            "observed_extreme_c", "peak_low_c", "peak_high_c",
-                            "bucket_low_c", "bucket_high_c", "local_hour"]
-                if c in df.columns]
-        st.dataframe(df[cols], use_container_width=True, hide_index=True)
-    else:
-        st.info("No high-bucket NO fires yet. Strategy fires past 18:00 station-local "
-                "(or 06:00 for min-target).")
-
-
-# Tab 4 — Persistence tail
-with tabs[4]:
-    st.caption("NO on tail buckets 4+ steps away from yesterday's actual.")
-    if pers_tail:
-        filled = [r for r in pers_tail if r.get("result") == "filled"]
-        st.write(f"**{len(filled)}** filled, {len(pers_tail)-len(filled)} non-fill log entries.")
-        if filled:
-            df = pd.DataFrame(filled).sort_values("ts_utc", ascending=False).head(50)
-            cols = [c for c in ["ts_utc", "station_id", "target", "target_date",
-                                "bucket_label", "bucket_kind",
-                                "prior_c", "prior_int", "distance_buckets",
-                                "no_ask_snapshot", "submitted_limit", "fill_price",
-                                "shares", "size_usd"]
-                    if c in df.columns]
-            st.dataframe(df[cols], use_container_width=True, hide_index=True)
-    else:
-        st.info("No persistence-tail fires yet. Strategy needs a prior-day "
-                "actual in data/forward_log.jsonl for the same (station, target). "
-                "First fires land once the resolver populates the prior.")
-
-
-# Tab 5 — Publication window
-with tabs[5]:
-    if pub_window:
-        st.write(f"**{len(pub_window)}** publication-window snapshots.")
-        df = pd.DataFrame([
-            {
-                "snapshot_ts": r.get("snapshot_ts_utc"),
-                "station": r.get("station_id"),
-                "target": r.get("target"),
-                "target_date": r.get("target_date"),
-                "offset_h": r.get("offset_h_after_midend"),
-                "metar_c": r.get("metar_final_extreme_c"),
-                "wug_max_c": r.get("wug_daily_max_c"),
-                "wug_min_c": r.get("wug_daily_min_c"),
-                "wug_status": r.get("wug_status"),
-                "matched_bucket": (
-                    f"{r.get('matched_bucket_kind')}/{r.get('matched_bucket_threshold')}"
-                    if r.get("matched_bucket_kind") else "—"
-                ),
-            }
-            for r in pub_window
-        ]).sort_values("snapshot_ts", ascending=False).head(100)
-        st.dataframe(df, use_container_width=True, hide_index=True)
-
-        st.subheader("Coverage")
-        distinct_sk = {(r["station_id"], r["target"], r["target_date"]) for r in pub_window}
-        st.metric("Distinct (station, target, date) tuples", len(distinct_sk))
-        statuses = Counter(r.get("wug_status") for r in pub_window)
-        st.write(f"WUG status distribution: {dict(statuses)}")
-    else:
-        st.info(
-            "No publication-window snapshots yet. First snapshot lands when a "
-            "station crosses end-of-resolution-day in local time (≤24h after "
-            "daemon start, depending on station's longitude)."
-        )
-
-
-# Tab 6 — Portfolio
-with tabs[6]:
-    if isinstance(portfolio, dict) and portfolio.get("positions"):
-        pos = portfolio["positions"]
-        st.write(f"**{len(pos)}** synthetic positions (paper, dry_run=True).")
-        df = pd.DataFrame(pos)
-        cols = [c for c in ["submitted_at", "station_id", "target_date",
-                            "bucket_label", "side", "shares", "entry_price",
-                            "position_usd", "status", "strategy"]
-                if c in df.columns]
-        if cols:
-            st.dataframe(
-                df[cols].sort_values("submitted_at", ascending=False),
-                use_container_width=True, hide_index=True,
-            )
-
-        # Per-strategy summary
-        if "strategy" in df.columns:
-            st.subheader("Per-strategy size")
-            by_strat = df.groupby("strategy")["position_usd"].agg(["count", "sum"])
-            by_strat.columns = ["positions", "size_usd_total"]
-            st.dataframe(by_strat, use_container_width=True)
-
-        # Tracker — Layer 7 progressive eval state
-        le = portfolio.get("last_evaluated_max_by_sk", {})
-        if le:
-            st.subheader("Progressive-eval tracker (high-bucket NO)")
-            st.caption(
-                "Highest temp (int, market unit) already evaluated for dead "
-                "buckets per (station, target). New WUG readings above this "
-                "trigger evaluation of the next-up bucket. (Shared tracker — "
-                "Layer 7 also used it but is now disabled.)"
-            )
-            tracker_df = pd.DataFrame([
-                {"key": k, "last_evaluated_int": v} for k, v in le.items()
-            ]).sort_values("key")
-            st.dataframe(tracker_df, use_container_width=True, hide_index=True)
-    else:
-        st.info("No positions in portfolio.json yet.")
-
-
-# Tab 7 — Logs
-with tabs[7]:
-    n_lines = st.slider("Lines to show", min_value=50, max_value=1000,
-                        value=200, step=50)
-    grep_filter = st.text_input("Filter (substring match)", value="")
-    lines = recent_journal("slim-daemon.service", lines=n_lines)
-    if grep_filter:
-        lines = [l for l in lines if grep_filter.lower() in l.lower()]
-    if lines:
-        st.code("\n".join(lines[-n_lines:]), language="log")
-    else:
-        st.info("No journal output (or systemctl not accessible).")
-
-
-# ── Fee + exclusions footer ─────────────────────────────────────────
-with st.expander("Live Polymarket fee config + excluded stations"):
-    fee_cfg = load_json(str(FEE_CACHE_PATH))
-    if fee_cfg:
-        st.write({
-            "taker_fee_rate": fee_cfg.get("taker_fee_rate"),
-            "maker_rebate_rate": fee_cfg.get("maker_rebate_rate"),
-            "source": fee_cfg.get("source"),
-            "fetched_at_utc": fee_cfg.get("fetched_at_utc"),
-            "age": fmt_age(fee_cfg.get("fetched_at_utc")) + " ago",
+    resolutions = []
+    for r in load_jsonl(DATA / "forward_log.jsonl"):
+        if r.get("actual_obs_c") is None:
+            continue
+        resolutions.append({
+            "station": r.get("station_id"), "target": r.get("target"),
+            "date": r.get("target_date"), "actual_c": round(float(r["actual_obs_c"]), 2),
+            "resolved_at": r.get("resolved_at_utc"), "source": r.get("source"),
         })
-    else:
-        st.caption("Fee config not yet cached.")
+    resolutions.sort(key=lambda x: x.get("resolved_at") or "", reverse=True)
 
-    excl = load_json(str(EXCLUSIONS_PATH))
-    if excl:
-        st.write("Excluded stations:", excl)
+    # health
+    sysd = systemd_show("slim-daemon")
+    fee_cfg = load_json(DATA / "fee_config_cache.json") or {}
+    excl = load_json(DATA / "excluded_stations.json") or {}
+    flags = read_flags()
+    # freshness: newest mtime among the live logs + forward_log
+    newest = 0.0
+    for cfg in STRATEGIES.values():
+        p = DATA / cfg["log"]
+        if p.exists():
+            newest = max(newest, p.stat().st_mtime)
+    fl = DATA / "forward_log.jsonl"
+    if fl.exists():
+        newest = max(newest, fl.stat().st_mtime)
+    data_age = int(time.time() - newest) if newest else None
+
+    health = {
+        "paper_only": bool(flags.get("paper_only", True)),
+        "kill_switch": Path("KILL_SWITCH").exists(),
+        "daemon_active": sysd.get("ActiveState", "?"),
+        "daemon_sub": sysd.get("SubState", "?"),
+        "daemon_since": sysd.get("ExecMainStartTimestamp", ""),
+        "daemon_restarts": sysd.get("NRestarts", "?"),
+        "data_age_s": data_age,
+        "flags": flags,
+        "live_strategies": [v["label"] for v in STRATEGIES.values()],
+        "taker_fee_rate": fee_cfg.get("taker_fee_rate"),
+        "n_excluded": len(excl) if isinstance(excl, (list, dict)) else 0,
+    }
+
+    return {
+        "generated_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "refresh_s": REFRESH_S,
+        "health": health,
+        "pnl": {
+            "total_net": round(tot_net, 2),
+            "today_net": round(today_net, 2),
+            "open_exposure": round(tot_open_exp, 2),
+            "n_open": n_open, "n_resolved": n_res,
+            "wins": wins, "losses": losses,
+            "win_rate": round(wins / n_res, 3) if n_res else None,
+            "by_strategy": sorted(by_strat.values(), key=lambda s: -s["net"]),
+            "by_day": [{"date": d, "net": round(v, 2)} for d, v in days],
+        },
+        "positions": {
+            "open": [p for p in positions if p["status"] == "open"][:300],
+            "resolved": [p for p in positions if p["status"] == "resolved"][:300],
+        },
+        "activity": activity,
+        "resolutions": resolutions[:120],
+        "journal": journal_tail("slim-daemon", 250),
+    }
 
 
-# ── Auto-refresh ────────────────────────────────────────────────────
-if auto_refresh:
-    time.sleep(30)
-    st.rerun()
+# ─────────────────────────────────────────── HTML (inline CSS + JS)
+
+PAGE = r"""<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Weather Bot</title>
+<style>
+:root{
+  --bg:#0b0e14; --panel:#141a24; --panel2:#1b2230; --line:#222c3a;
+  --txt:#e6edf3; --mut:#8b98a9; --accent:#4aa8ff; --accent2:#2b3445;
+  --pos:#3fb950; --neg:#f85149; --warn:#d29922;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--txt);
+  font:14px/1.45 "Segoe UI",system-ui,-apple-system,sans-serif}
+.mono{font-family:"SF Mono","Consolas",ui-monospace,monospace}
+header{display:flex;align-items:center;gap:14px;padding:14px 22px;
+  background:linear-gradient(90deg,#11161f,#0b0e14);border-bottom:1px solid var(--line);
+  position:sticky;top:0;z-index:5}
+header h1{font-size:16px;margin:0;letter-spacing:.3px;font-weight:600}
+header .dot{width:9px;height:9px;border-radius:50%;display:inline-block}
+.badges{display:flex;gap:8px;flex-wrap:wrap;margin-left:auto;align-items:center}
+.badge{font-size:11px;padding:3px 9px;border-radius:20px;border:1px solid var(--line);
+  background:var(--panel);color:var(--mut)}
+.badge.on{color:var(--pos);border-color:#1d3a25}
+.badge.off{color:var(--mut)}
+.badge.paper{color:var(--accent);border-color:#1d3550}
+.badge.bad{color:var(--neg);border-color:#3a1d1d}
+.updated{font-size:11px;color:var(--mut)}
+nav{display:flex;gap:4px;padding:10px 22px 0;background:var(--bg);
+  border-bottom:1px solid var(--line);position:sticky;top:53px;z-index:4}
+nav button{background:none;border:none;color:var(--mut);padding:9px 16px;cursor:pointer;
+  font-size:13px;border-bottom:2px solid transparent;border-radius:6px 6px 0 0}
+nav button:hover{color:var(--txt);background:var(--panel)}
+nav button.active{color:var(--txt);border-bottom-color:var(--accent);font-weight:600}
+main{padding:20px 22px 60px;max-width:1500px}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px;margin-bottom:22px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px 18px}
+.card .k{font-size:12px;color:var(--mut);text-transform:uppercase;letter-spacing:.5px}
+.card .v{font-size:26px;font-weight:700;margin-top:6px;font-family:ui-monospace,monospace}
+.card .sub{font-size:12px;color:var(--mut);margin-top:4px}
+.pos{color:var(--pos)} .neg{color:var(--neg)} .mut{color:var(--mut)} .warn{color:var(--warn)}
+.section{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+  padding:6px 0 0;margin-bottom:22px;overflow:hidden}
+.section h2{font-size:13px;margin:0;padding:14px 18px 10px;color:var(--mut);
+  text-transform:uppercase;letter-spacing:.5px;font-weight:600}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{text-align:left;color:var(--mut);font-weight:600;font-size:11px;text-transform:uppercase;
+  letter-spacing:.4px;padding:8px 14px;border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--panel)}
+td{padding:8px 14px;border-bottom:1px solid #1a212c}
+tr:hover td{background:var(--panel2)}
+td.num,th.num{text-align:right;font-family:ui-monospace,monospace}
+.pill{font-size:11px;padding:2px 8px;border-radius:10px;background:var(--accent2);color:var(--txt)}
+.pill.no{background:#2a2030;color:#e6a8d0} .pill.yes{background:#1d3550;color:#9fd0ff}
+.tag{font-size:11px;color:var(--mut)}
+.bars{display:flex;align-items:flex-end;gap:5px;height:70px;padding:6px 18px 14px}
+.bars .b{flex:1;min-width:6px;border-radius:3px 3px 0 0;position:relative}
+.bars .b span{position:absolute;bottom:-15px;left:50%;transform:translateX(-50%);
+  font-size:9px;color:var(--mut);white-space:nowrap}
+.scroll{max-height:520px;overflow:auto}
+pre.log{margin:0;padding:14px 18px;font-size:12px;line-height:1.5;color:#b9c4d0;
+  max-height:600px;overflow:auto;white-space:pre-wrap;word-break:break-word}
+.hidden{display:none}
+.empty{padding:26px 18px;color:var(--mut);text-align:center}
+.flex{display:flex;gap:22px;flex-wrap:wrap}.flex>.section{flex:1;min-width:340px}
+.right{margin-left:auto}
+a.refresh{color:var(--accent);cursor:pointer;font-size:12px;text-decoration:none}
+</style></head>
+<body>
+<header>
+  <span id="hdot" class="dot"></span>
+  <h1>Weather Bot <span class="tag mono" id="mode"></span></h1>
+  <div class="badges" id="badges"></div>
+</header>
+<nav id="nav"></nav>
+<main>
+  <div class="updated" style="margin-bottom:14px">
+    Updated <span id="updated" class="mono"></span> · auto-refresh <span id="rs"></span>s ·
+    <a class="refresh" onclick="load()">refresh now</a>
+  </div>
+  <div id="view"></div>
+</main>
+<script>
+const TABS = ["Overview","Positions & P&L","Strategies","Resolutions","System"];
+let TAB = 0, D = null;
+const $ = (h)=>{const t=document.createElement('template');t.innerHTML=h.trim();return t.content.firstChild;};
+const money=(v)=> v==null?'—':(v>=0?'+':'')+'$'+v.toFixed(2);
+const cls=(v)=> v==null?'mut':(v>0?'pos':(v<0?'neg':'mut'));
+const pct=(v)=> v==null?'—':(v*100).toFixed(0)+'%';
+const esc=(s)=> (s==null?'':String(s)).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+const ago=(s)=> s==null?'—':(s<90?s+'s':(s<5400?Math.round(s/60)+'m':Math.round(s/3600)+'h'))+' ago';
+
+function badges(h){
+  const f=h.flags||{};
+  const b=[];
+  b.push(`<span class="badge ${h.paper_only?'paper':'bad'}">${h.paper_only?'PAPER-ONLY':'LIVE ⚠'}</span>`);
+  if(h.kill_switch) b.push(`<span class="badge bad">KILL_SWITCH</span>`);
+  const da=(h.daemon_active==='active');
+  b.push(`<span class="badge ${da?'on':'bad'}">daemon ${esc(h.daemon_active)}</span>`);
+  for(const [k,label] of [['consensus_basket','basket'],['high_bucket_no','hi-NO'],['persistence_tail','tail']])
+    b.push(`<span class="badge on">${label}</span>`);
+  for(const k of ['layer7','v2','consensus_yes','consistency_arb'])
+    b.push(`<span class="badge off">${k} off</span>`);
+  return b.join('');
+}
+
+function navbar(){
+  const n=document.getElementById('nav'); n.innerHTML='';
+  TABS.forEach((t,i)=>{const btn=$(`<button class="${i===TAB?'active':''}">${t}</button>`);
+    btn.onclick=()=>{TAB=i;render();}; n.appendChild(btn);});
+}
+
+function tbl(cols, rows, render){
+  if(!rows||!rows.length) return `<div class="empty">Nothing yet.</div>`;
+  let h='<div class="scroll"><table><thead><tr>'+cols.map(c=>`<th class="${c.n?'num':''}">${c.t}</th>`).join('')+'</tr></thead><tbody>';
+  h+=rows.map(r=>'<tr>'+render(r)+'</tr>').join('');
+  return h+'</tbody></table></div>';
+}
+
+function sidePill(s){return `<span class="pill ${s==='NO'?'no':'yes'}">${s}</span>`;}
+
+function overview(){
+  const p=D.pnl, h=D.health;
+  let html=`<div class="cards">
+    <div class="card"><div class="k">Realized P&L (net of fee)</div>
+      <div class="v ${cls(p.total_net)}">${money(p.total_net)}</div>
+      <div class="sub">${p.n_resolved} resolved · win ${pct(p.win_rate)}</div></div>
+    <div class="card"><div class="k">Today</div>
+      <div class="v ${cls(p.today_net)}">${money(p.today_net)}</div>
+      <div class="sub">UTC ${esc(D.generated_utc.slice(0,10))}</div></div>
+    <div class="card"><div class="k">Open exposure</div>
+      <div class="v">$${p.open_exposure.toFixed(2)}</div>
+      <div class="sub">${p.n_open} open positions</div></div>
+    <div class="card"><div class="k">Record</div>
+      <div class="v">${p.wins}<span class="mut" style="font-size:16px">/${p.wins+p.losses}</span></div>
+      <div class="sub">${p.losses} losses</div></div>
+    <div class="card"><div class="k">Data freshness</div>
+      <div class="v ${h.data_age_s!=null&&h.data_age_s<600?'pos':'warn'}" style="font-size:22px">${ago(h.data_age_s)}</div>
+      <div class="sub">daemon restarts: ${esc(h.daemon_restarts)}</div></div>
+  </div>`;
+
+  // by-day bars
+  const days=p.by_day||[];
+  if(days.length){
+    const mx=Math.max(1,...days.map(d=>Math.abs(d.net)));
+    html+=`<div class="section"><h2>Realized P&L by event date (net of fee)</h2><div class="bars">`+
+      days.map(d=>{const hgt=Math.max(3,Math.abs(d.net)/mx*52);
+        return `<div class="b" title="${d.date}: ${money(d.net)}" style="height:${hgt}px;background:${d.net>=0?'var(--pos)':'var(--neg)'}"><span>${d.date.slice(5)}</span></div>`;}).join('')+
+      `</div></div>`;
+  }
+
+  html+=`<div class="section"><h2>Per-strategy P&L</h2>`+tbl(
+    [{t:'Strategy'},{t:'Net',n:1},{t:'Resolved',n:1},{t:'Win rate',n:1},{t:'Open',n:1},{t:'Open $',n:1}],
+    p.by_strategy,
+    s=>`<td>${esc(s.label)}</td><td class="num ${cls(s.net)}">${money(s.net)}</td>
+        <td class="num">${s.resolved}</td><td class="num">${pct(s.win_rate)}</td>
+        <td class="num">${s.open}</td><td class="num">$${s.open_exposure.toFixed(2)}</td>`)+`</div>`;
+
+  html+=`<div class="section"><h2>Recent activity</h2>`+tbl(
+    [{t:'Time'},{t:'Strategy'},{t:'Station'},{t:'Bucket'},{t:'Side'},{t:'Shares',n:1},{t:'Fill',n:1},{t:'Status'},{t:'Net',n:1}],
+    D.activity,
+    r=>`<td class="mono tag">${esc((r.ts||'').slice(5,19).replace('T',' '))}</td>
+        <td>${esc((r.strategy||'').replace('consensus_basket','basket').replace('high_bucket_no','hi-NO').replace('persistence_tail','tail'))}</td>
+        <td>${esc(r.station)} <span class="tag">${esc(r.target)}</span></td>
+        <td>${esc(r.bucket)}</td><td>${sidePill(r.side)}</td>
+        <td class="num">${r.shares}</td><td class="num">${r.fill}</td>
+        <td><span class="tag">${esc(r.status)}</span></td>
+        <td class="num ${cls(r.net)}">${r.net==null?'—':money(r.net)}</td>`)+`</div>`;
+  return html;
+}
+
+function positionsTab(){
+  const o=D.positions.open, r=D.positions.resolved;
+  const row=(p,resolved)=>`<td class="mono tag">${esc((p.ts||'').slice(5,16).replace('T',' '))}</td>
+      <td>${esc(p.strategy.replace('consensus_basket','basket').replace('high_bucket_no','hi-NO').replace('persistence_tail','tail'))}</td>
+      <td>${esc(p.station)} <span class="tag">${esc(p.target)} ${esc(p.date)}</span></td>
+      <td>${esc(p.bucket)}</td><td>${sidePill(p.side)}</td>
+      <td class="num">${p.shares}</td><td class="num">${p.fill}</td>
+      <td class="num">$${p.cost.toFixed(2)}</td>`+
+      (resolved?`<td class="num">${p.won?'<span class="pos">WON</span>':'<span class="neg">lost</span>'}</td>
+      <td class="num ${cls(p.net)}">${money(p.net)}</td>`:'');
+  let html=`<div class="flex">
+    <div class="section"><h2>Open positions · ${o.length} · $${D.pnl.open_exposure.toFixed(2)} exposure</h2>`+
+    tbl([{t:'Filled'},{t:'Strat'},{t:'Event'},{t:'Bucket'},{t:'Side'},{t:'Sh',n:1},{t:'Fill',n:1},{t:'Cost',n:1}],o,p=>row(p,false))+`</div></div>`;
+  html+=`<div class="section"><h2>Resolved positions · ${r.length} · net ${money(D.pnl.total_net)}</h2>`+
+    tbl([{t:'Filled'},{t:'Strat'},{t:'Event'},{t:'Bucket'},{t:'Side'},{t:'Sh',n:1},{t:'Fill',n:1},{t:'Cost',n:1},{t:'Result',n:1},{t:'Net',n:1}],r,p=>row(p,true))+`</div>`;
+  return html;
+}
+
+function strategiesTab(){
+  let html='';
+  for(const s of D.pnl.by_strategy){
+    const open=D.positions.open.filter(p=>p.strategy===s.strategy);
+    const res=D.positions.resolved.filter(p=>p.strategy===s.strategy).slice(0,40);
+    html+=`<div class="section"><h2>${esc(s.label)} — net ${money(s.net)} · win ${pct(s.win_rate)} · ${s.open} open ($${s.open_exposure.toFixed(2)})</h2>`+
+      tbl([{t:'Filled'},{t:'Event'},{t:'Bucket'},{t:'Side'},{t:'Fill',n:1},{t:'Status'},{t:'Net',n:1}],
+        [...open.slice(0,15),...res],
+        p=>`<td class="mono tag">${esc((p.ts||'').slice(5,16).replace('T',' '))}</td>
+            <td>${esc(p.station)} <span class="tag">${esc(p.target)} ${esc(p.date)}</span></td>
+            <td>${esc(p.bucket)}</td><td>${sidePill(p.side)}</td><td class="num">${p.fill}</td>
+            <td><span class="tag">${p.status}</span></td>
+            <td class="num ${cls(p.net)}">${p.net==null?'—':money(p.net)}</td>`)+`</div>`;
+  }
+  return html||`<div class="empty">No strategy data.</div>`;
+}
+
+function resolutionsTab(){
+  return `<div class="section"><h2>Wunderground resolutions (truth source)</h2>`+tbl(
+    [{t:'Resolved at'},{t:'Station'},{t:'Target'},{t:'Date'},{t:'Actual °C',n:1},{t:'Source'}],
+    D.resolutions,
+    r=>`<td class="mono tag">${esc((r.resolved_at||'').slice(0,19).replace('T',' '))}</td>
+        <td>${esc(r.station)}</td><td>${esc(r.target)}</td><td>${esc(r.date)}</td>
+        <td class="num">${r.actual_c}</td><td class="tag">${esc(r.source)}</td>`)+`</div>`;
+}
+
+function systemTab(){
+  const h=D.health,f=h.flags||{};
+  let html=`<div class="cards">
+    <div class="card"><div class="k">Mode</div><div class="v ${h.paper_only?'pos':'neg'}" style="font-size:20px">${h.paper_only?'PAPER-ONLY':'LIVE'}</div>
+      <div class="sub">kill switch: ${h.kill_switch?'<span class="neg">ON</span>':'off'}</div></div>
+    <div class="card"><div class="k">Daemon</div><div class="v" style="font-size:20px">${esc(h.daemon_active)}/${esc(h.daemon_sub)}</div>
+      <div class="sub">since ${esc((h.daemon_since||'').slice(0,19))}</div></div>
+    <div class="card"><div class="k">Taker fee rate</div><div class="v" style="font-size:20px">${h.taker_fee_rate==null?'—':h.taker_fee_rate}</div>
+      <div class="sub">${h.n_excluded} excluded stations</div></div>
+    <div class="card"><div class="k">Strategy flags</div>
+      <div class="sub" style="margin-top:8px;line-height:1.9">
+        ${Object.entries({layer7:f.layer7,v2:f.v2,consensus_yes:f.consensus_yes,consistency_arb:f.consistency_arb})
+          .map(([k,v])=>`${k}: <span class="${v?'pos':'mut'}">${v?'ON':'off'}</span>`).join('<br>')}</div></div>
+  </div>`;
+  html+=`<div class="section"><h2>slim-daemon journal (last 250)</h2><pre class="log" id="log">`+
+    (D.journal||[]).map(esc).join('\n')+`</pre></div>`;
+  return html;
+}
+
+function render(){
+  navbar();
+  document.getElementById('badges').innerHTML=badges(D.health);
+  document.getElementById('mode').textContent='';
+  document.getElementById('hdot').style.background = (D.health.daemon_active==='active' && D.health.paper_only)?'var(--pos)':'var(--neg)';
+  document.getElementById('updated').textContent=(D.generated_utc||'').replace('T',' ');
+  document.getElementById('rs').textContent=D.refresh_s;
+  const v=document.getElementById('view');
+  v.innerHTML=[overview,positionsTab,strategiesTab,resolutionsTab,systemTab][TAB]();
+  const lg=document.getElementById('log'); if(lg) lg.scrollTop=lg.scrollHeight;
+}
+
+async function load(){
+  try{
+    const r=await fetch('/api/data',{cache:'no-store'}); D=await r.json(); render();
+  }catch(e){ document.getElementById('view').innerHTML='<div class="empty">Failed to load /api/data: '+esc(e)+'</div>'; }
+}
+load(); setInterval(load, __REFRESH__*1000);
+</script>
+</body></html>"""
+
+
+# ─────────────────────────────────────────── server
+
+class Handler(BaseHTTPRequestHandler):
+    def _send(self, code, body, ctype):
+        data = body.encode("utf-8") if isinstance(body, str) else body
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        try:
+            if self.path.startswith("/api/data"):
+                self._send(200, json.dumps(compute()), "application/json")
+            elif self.path in ("/", "/index.html"):
+                self._send(200, PAGE.replace("__REFRESH__", str(REFRESH_S)), "text/html; charset=utf-8")
+            elif self.path == "/healthz":
+                self._send(200, "ok", "text/plain")
+            else:
+                self._send(404, "not found", "text/plain")
+        except BrokenPipeError:
+            pass
+        except Exception as exc:  # never crash the server on one bad request
+            try:
+                self._send(500, json.dumps({"error": str(exc)}), "application/json")
+            except Exception:
+                pass
+
+    def log_message(self, *a):  # quiet
+        return
+
+
+def main():
+    srv = ThreadingHTTPServer((HOST, PORT), Handler)
+    print(f"[dashboard] serving http://{HOST}:{PORT}  (refresh {REFRESH_S}s)")
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        srv.shutdown()
+
+
+if __name__ == "__main__":
+    main()

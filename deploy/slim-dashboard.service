@@ -1,5 +1,5 @@
 [Unit]
-Description=Weather Bot — slim_dashboard.py (Streamlit)
+Description=Weather Bot — slim_dashboard.py (custom HTTP dashboard)
 After=network-online.target slim-daemon.service
 Wants=network-online.target
 
@@ -8,14 +8,10 @@ Wants=network-online.target
 User=/USER
 WorkingDirectory=/PROJECT_PATH/Weather_Bot
 Environment=PYTHONUNBUFFERED=1
-# Bind to localhost only. Reach it via SSH tunnel:
-#   ssh -L 8501:localhost:8501 weather-vps2
-ExecStart=/PROJECT_PATH/Weather_Bot/.venv/bin/streamlit run \
-    /PROJECT_PATH/Weather_Bot/slim_dashboard.py \
-    --server.address 127.0.0.1 \
-    --server.port 8501 \
-    --server.headless true \
-    --browser.gatherUsageStats false
+# Stdlib HTTP server (no Streamlit). Binds 127.0.0.1:8501 internally.
+# Reach it via SSH tunnel:  ssh -L 8501:localhost:8501 weather-vps2
+ExecStart=/PROJECT_PATH/Weather_Bot/.venv/bin/python \
+    /PROJECT_PATH/Weather_Bot/slim_dashboard.py
 
 Restart=on-failure
 RestartSec=5
