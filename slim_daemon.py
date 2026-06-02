@@ -619,6 +619,7 @@ async def refresh_events_and_pollers(state: DaemonState) -> None:
             http=state.http,
             book_cache=state.book_cache,
             leader_state=state.current_leader,
+            extreme_state=state.latest_extreme,
         )
         if sweep_counts and sweep_counts.get("snapshots", 0) > 0:
             print(f"[sweep-log] snapshots={sweep_counts['snapshots']} "
@@ -974,7 +975,8 @@ async def _fire_basket_cross(state: "DaemonState", sk, hw_now: int) -> None:
         try:
             await log_basket_sweep(
                 events=[ev], http=state.http, book_cache=state.book_cache,
-                leader_state=state.current_leader)
+                leader_state=state.current_leader,
+                extreme_state=state.latest_extreme)
         except Exception as exc:
             print(f"[basket-cross sweep] {sk}: {type(exc).__name__}: {exc}",
                   file=sys.stderr)

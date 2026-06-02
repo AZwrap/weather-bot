@@ -140,6 +140,7 @@ async def log_basket_sweep(
     http,
     book_cache=None,
     leader_state=None,
+    extreme_state=None,
     low: int = LOW_PENNY,
     high: int = HIGH_PENNY,
     size_usd: float = SIZE_USD,
@@ -257,6 +258,15 @@ async def log_basket_sweep(
             if ls is not None and len(ls) >= 3 and ls[0] == leader.bucket_label:
                 leader_dwell_s = round(now_dt.timestamp() - float(ls[2]), 1)
 
+        # Observed max/min so far (WUG-primary, METAR-fallback) at snapshot
+        # time — enables the OBS-CONFIRMED roll replay (analyze_roll_realistic):
+        # detect when the observed extreme has passed the held YES bucket so a
+        # roll fires only on a genuinely-dead favorite, not a transient market
+        # flip. WUG stays the resolution oracle; this is signal-only.
+        observed_extreme_c = None
+        if extreme_state is not None:
+            observed_extreme_c = extreme_state.get((station.station_id, target, td_iso))
+
         _log({
             "ts_utc": now_dt.isoformat(),
             "station_id": station.station_id,
@@ -268,6 +278,7 @@ async def log_basket_sweep(
             "local_hour": local_hour,           # time-gate: station-local hour
             "hours_to_midend": hours_to_midend, # time-gate: hrs to window-end
             "leader_dwell_s": leader_dwell_s,   # stability-gate: leader dwell
+            "observed_extreme_c": observed_extreme_c,  # obs max/min so far (roll death-signal)
             "winner": winner,                   # None only if winner book vanished
             "fade_no": fade_no,
             "n_no_legs": len(fade_no),
