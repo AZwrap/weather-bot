@@ -42,13 +42,26 @@ from .scanner import TradeSignal
 
 DEFAULT_LOG_PATH = Path("data/consensus_basket_log.jsonl")
 ATTEMPTED_PATH = Path("data/consensus_basket_attempted.json")
-"""Persisted set of (station|target|date) keys we've already tried a
-basket for. A basket is a once-per-event-per-day shot: when the winner
-emerges at $0.85 we build it once. Without this guard, an event whose
-legs all fail to fill (dead /book near resolution → 0 positions → the
-position-based dedupe can't catch it) would re-trigger every refresh
-and re-fetch depth for ~10 dead tokens, risking a Cloudflare rate-limit
-ban (the arb playbook warns ≳5 RPS trips 429/1015)."""
+"""Persisted per-event state: {f"station|target|date": "locked" | int}.
+  - "locked"  → committed (winner YES filled, OR we gave up after
+                MAX_NOFILL_ATTEMPTS no-fill tries). Never re-fire.
+  - int n     → n consecutive attempts where the winner was ≥0.85 but its
+                YES leg could NOT fill (illiquid/uncertain). We did NOT
+                place anything and did NOT lock — the event stays eligible
+                so a LATER, fillable bucket (the corrected leader) can be
+                taken instead of being blocked on the first cross.
+We only lock on a FILLED winner (or the cap), so a phantom/unfillable
+0.85 cross never burns the event. The cap bounds REST on a genuinely
+dead winner (a sticky ≥0.85 quote with no depth) — the Cloudflare guard
+(arb playbook: ≳5 RPS trips 429/1015). Backward-compatible with the old
+list-of-locked-keys format."""
+
+MAX_NOFILL_ATTEMPTS: int = 10
+"""After this many attempts where the winner is ≥0.85 but unfillable,
+give up and lock the event (it's genuinely too illiquid). Generous so it
+doesn't pre-empt a winner that becomes fillable later; only a transient
+quote that REVERTS below 0.85 is skipped earlier (no count), so this only
+bites a persistently-stuck dead book."""
 
 TRIGGER_YES: float = 0.85
 """A bucket's YES ask must reach this for it to count as the emerged
@@ -78,17 +91,20 @@ def _log(record: dict, log_path: Path = DEFAULT_LOG_PATH) -> None:
         pass
 
 
-def _load_attempted(path: Path = ATTEMPTED_PATH) -> set[str]:
+def _load_attempted(path: Path = ATTEMPTED_PATH) -> dict:
     try:
-        return set(json.loads(path.read_text(encoding="utf-8")))
+        d = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(d, list):          # old format: list of locked keys
+            return {k: "locked" for k in d}
+        return dict(d)
     except (OSError, ValueError, TypeError):
-        return set()
+        return {}
 
 
-def _save_attempted(keys: set[str], path: Path = ATTEMPTED_PATH) -> None:
+def _save_attempted(state: dict, path: Path = ATTEMPTED_PATH) -> None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(sorted(keys)), encoding="utf-8")
+        path.write_text(json.dumps(state, sort_keys=True), encoding="utf-8")
     except (OSError, TypeError, ValueError):
         pass
 
@@ -246,7 +262,7 @@ async def detect_and_execute_consensus_basket(
             counts["skipped_winner_no_token"] += 1
             continue
         attempt_key = f"{station.station_id}|{target}|{td_iso}"
-        if attempt_key in attempted or _already_placed(portfolio, event_tokens):
+        if attempted.get(attempt_key) == "locked" or _already_placed(portfolio, event_tokens):
             counts["skipped_already_placed"] += 1
             continue
 
@@ -264,21 +280,32 @@ async def detect_and_execute_consensus_basket(
             print(f"  [basket] {station.station_id}/{target} {td_iso}: winner "
                   f"{winner.bucket_label}@{winner_ya:.2f} → placing basket")
 
-        # Winner YES leg (don't chase price up — cap at ask + slippage ticks).
-        # 0.98 ceiling: normally we fire on first 0.85 crossing so the ask is
-        # ~0.85; the high cap only matters on a cold-start where we first see
-        # the event already converged, and we still want the YES leg filled.
+        # Winner YES leg FIRST (don't chase price up — cap at ask + slippage
+        # ticks; 0.98 ceiling for cold-start already-converged events).
+        # We commit the basket (fade the field + lock the event) ONLY if the
+        # winner actually fills. A winner we can't fill means the favorite is
+        # still illiquid/uncertain — so we place NOTHING and DON'T lock, and
+        # the event stays eligible for a LATER fillable bucket (the corrected
+        # leader) instead of being permanently blocked on this first cross.
         yes_limit = min(round(winner_ya + YES_SLIPPAGE_TICKS, 2), 0.98)
-        out = _place_leg(
+        wout = _place_leg(
             m=winner, side="YES", limit=yes_limit, size_usd=size_usd,
             depth=depth_map.get(winner.yes_token_id), station=station,
             target=target, target_date_iso=td_iso, client=client,
             portfolio=portfolio, portfolio_path=portfolio_path, log_path=log_path,
         )
-        counts[f"winner_{out}"] += 1
-        legs_filled = 1 if out == "filled" else 0
+        counts[f"winner_{wout}"] += 1
+        if wout != "filled":
+            # Winner unfillable → place nothing, don't lock. Count the miss;
+            # give up only after MAX_NOFILL_ATTEMPTS (dead-book REST backstop).
+            n = int(attempted.get(attempt_key) or 0) + 1
+            attempted[attempt_key] = "locked" if n >= MAX_NOFILL_ATTEMPTS else n
+            attempted_dirty = True
+            counts["winner_unfilled"] += 1
+            continue
+        legs_filled = 1
 
-        # NO legs on every other bucket.
+        # Winner filled → fade every other bucket with NO.
         for m in ev.markets:
             if m is winner:
                 continue
@@ -293,15 +320,12 @@ async def detect_and_execute_consensus_basket(
             if out == "filled":
                 legs_filled += 1
 
-        # Persist once after the whole basket (legs added in-memory above).
+        # Persist + LOCK the event now that we've backed a fillable winner.
         try:
             portfolio.save(portfolio_path)
         except Exception:
             pass
-        # Mark attempted regardless of fill outcome — a basket is a
-        # once-per-event shot. Even a 0-fill (dead /book) attempt must
-        # not re-trigger every refresh (REST-storm / rate-limit guard).
-        attempted.add(attempt_key)
+        attempted[attempt_key] = "locked"
         attempted_dirty = True
         counts["baskets_placed"] += 1
         counts["legs_filled"] += legs_filled
