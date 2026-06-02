@@ -157,6 +157,12 @@ class DaemonState:
         # Latest WUG-observed extreme per (sk) — fed to the fast NO-side
         # sweep so it can re-run Layer7/high-bucket-NO between WUG ticks.
         self.latest_extreme: dict[tuple[str, str, str], float] = {}
+        # Held consensus-basket FAVORITE YES tokens → {sk, bucket, entry,
+        # last_bid}. Rebuilt each refresh from open basket positions; used to
+        # log the favorite's best_bid at WS resolution (data/basket_favorite_
+        # ticks.jsonl) so a price-stop / roll can be backtested at the real
+        # sub-second execution speed (not the coarse sweep cadence).
+        self.basket_fav_tokens: dict[str, dict] = {}
         self.shutdown_event = asyncio.Event()
         self.ws_task: asyncio.Task | None = None
         self.wug_pool: WUGPollerPool | None = None
@@ -455,6 +461,30 @@ async def refresh_events_and_pollers(state: DaemonState) -> None:
             if m.no_token_id:
                 new_sk_by_token[m.no_token_id] = sk
     state.sk_by_token = new_sk_by_token
+
+    # Register held basket FAVORITE YES tokens (today/tomorrow events) so the
+    # WS handler logs their best_bid sub-second. Preserve last_bid across
+    # refreshes so we don't re-log an unchanged price.
+    _today_iso = datetime.now(timezone.utc).date().isoformat()
+    new_favs: dict[str, dict] = {}
+    try:
+        for p in state.portfolio.positions:
+            if (getattr(p, "strategy", "") == "consensus_basket"
+                    and getattr(p, "side", "") == "YES"
+                    and (p.target_date or "") >= _today_iso):
+                tok = p.token_id
+                sk = new_sk_by_token.get(tok)
+                if sk is None:
+                    continue
+                prev = state.basket_fav_tokens.get(tok, {})
+                new_favs[tok] = {
+                    "sk": sk, "bucket": p.bucket_label,
+                    "entry": float(p.entry_price),
+                    "last_bid": prev.get("last_bid", -1.0),
+                }
+    except Exception as exc:
+        print(f"[fav-ticks] build failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+    state.basket_fav_tokens = new_favs
 
     # Refresh WUG pollers — only run pollers for events that are
     # currently "in flight" in STATION-LOCAL time. The previous version
@@ -863,6 +893,18 @@ def _log_leader_flip(record: dict) -> None:
         pass
 
 
+_BASKET_FAV_TICK_LOG = Path("data/basket_favorite_ticks.jsonl")
+
+
+def _log_basket_fav_tick(record: dict) -> None:
+    try:
+        _BASKET_FAV_TICK_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with _BASKET_FAV_TICK_LOG.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, default=str) + "\n")
+    except (OSError, TypeError, ValueError):
+        pass
+
+
 def _maybe_fire_basket_on_cross(state: "DaemonState", msg: dict) -> None:
     """WS-delta basket trigger — the 'sub-second, no polling' path.
 
@@ -886,6 +928,26 @@ def _maybe_fire_basket_on_cross(state: "DaemonState", msg: dict) -> None:
         sk = state.sk_by_token.get(aid)
         if sk is not None:
             affected.add(sk)
+        # Sub-second favorite-YES price trajectory logging. If this token is a
+        # held basket favorite, persist its best_bid whenever it moves ≥0.5pp —
+        # the data a price-stop/roll needs at REAL execution speed (the sweep
+        # only samples at leader high-waters, too coarse to see "sell at 0.70").
+        fav = state.basket_fav_tokens.get(aid)
+        if fav is not None:
+            bid = ch.get("best_bid")
+            if bid is not None:
+                try:
+                    bid = float(bid)
+                except (TypeError, ValueError):
+                    bid = None
+                if bid is not None and abs(bid - fav.get("last_bid", -1.0)) >= 0.005:
+                    fav["last_bid"] = bid
+                    _log_basket_fav_tick({
+                        "ts_utc": datetime.now(timezone.utc).isoformat(),
+                        "station_id": fav["sk"][0], "target": fav["sk"][1],
+                        "target_date": fav["sk"][2], "bucket_label": fav["bucket"],
+                        "yes_token_id": aid, "entry": fav["entry"], "best_bid": bid,
+                    })
     if not affected:
         return
 

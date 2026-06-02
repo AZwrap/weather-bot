@@ -110,4 +110,5 @@ DEFAULT_LOG_PATHS = [
     Path("data/time_of_day_filter_log.jsonl"),
     Path("data/daemon_cycle_metrics.jsonl"),
     Path("data/filled_position_no_ask_trajectory.jsonl"),
+    Path("data/basket_favorite_ticks.jsonl"),
 ]
