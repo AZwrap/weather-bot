@@ -682,6 +682,12 @@ async def refresh_events_and_pollers(state: DaemonState) -> None:
     )
 
 
+RESOLVER_BATCH_TIMEOUT_S = 300.0
+"""Max wall-time for one resolve_settled_events batch (50+ sequential WUG
+fetches). A stuck fetch hits this → TimeoutError → logged → loop retries
+next cycle, instead of hanging the resolver forever (the 2026-06-03 bug)."""
+
+
 async def _resolver_loop(state: "DaemonState", interval_s: float = 1800.0) -> None:
     """Background daily-resolver loop. Runs every `interval_s` (default
     30 min). Resolutions only change once per station per day, so a
@@ -696,10 +702,21 @@ async def _resolver_loop(state: "DaemonState", interval_s: float = 1800.0) -> No
     while not state.shutdown_event.is_set():
         try:
             if state.events_by_sk:
-                res_counts = await resolve_settled_events(
-                    events_by_sk=state.events_by_sk,
-                    stations_by_sk=state.stations_by_sk,
-                    http=state.http,
+                # Bound the whole batch: resolve_settled_events does 50+
+                # SEQUENTIAL WUG fetches, and a single fetch that hangs (stuck
+                # connection, no read timeout) would otherwise freeze this loop
+                # FOREVER with no exception (observed 2026-06-03: resolver died
+                # silently at 09:16 for ~14h). wait_for cancels a stuck batch →
+                # raises TimeoutError → caught below → loop retries next cycle.
+                # Records resolved before the hang are already appended, so the
+                # only cost of a timeout is finishing the rest next round.
+                res_counts = await asyncio.wait_for(
+                    resolve_settled_events(
+                        events_by_sk=state.events_by_sk,
+                        stations_by_sk=state.stations_by_sk,
+                        http=state.http,
+                    ),
+                    timeout=RESOLVER_BATCH_TIMEOUT_S,
                 )
                 if res_counts.get("resolved", 0) > 0:
                     print(f"[resolver] {res_counts}")
