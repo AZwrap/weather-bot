@@ -96,7 +96,12 @@ CONSENSUS_YES_ENABLED: bool = False
 # $0.98 cap — a structural bleeder. Both call sites are gated on this flag
 # (code + logs retained, tab dropped from the dashboard) so a single flip
 # re-enables it without re-adding the calls.
-LAYER7_ENABLED: bool = False
+# RE-ENABLED 2026-06-03 by operator: re-validate (PAPER) whether the native-unit
+# WUG fetch + dodgy-station exclusions (the likely cause of the ~8% guarantee-
+# failures = the bleed) lifted the redeem rate above the ~97% breakeven. WATCH
+# the redeem rate at N; the $0.98 NO cap economics stay marginal regardless
+# (a lower cap would be the real fix, separate change).
+LAYER7_ENABLED: bool = True
 
 # Consistency arb DISABLED 2026-06-02 by operator request. After hardening
 # (REST depth + fees + empty-book/implausible-margin artifact filters), real
