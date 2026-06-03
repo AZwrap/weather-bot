@@ -61,6 +61,61 @@ def unit_for(sid):
     return getattr(STATIONS_BY_ID.get(sid), "unit", None) or "C"
 
 
+def sweep_fire_map(trigger=0.82):
+    """(sk) -> the fire snapshot (first sweep row at/above trigger), for reading
+    the per-snapshot yes3_arb / observed_extreme_c at fire time."""
+    by_sk = defaultdict(list)
+    for r in load(DATA / "basket_sweep_log.jsonl"):
+        by_sk[(r.get("station_id"), r.get("target"), r.get("target_date"))].append(r)
+    out = {}
+    for sk, rows in by_sk.items():
+        rows.sort(key=lambda r: r.get("ts_utc") or "")
+        fire = next((r for r in rows if float(r.get("leader_yes_ask") or 0) >= trigger), None)
+        if fire is not None:
+            out[sk] = fire
+    return out
+
+
+def neighbor_gap(fire):
+    """Market-implied contestedness: favorite YES ask − max ±1-neighbor YES ask.
+    SMALL gap = the market gives a neighbor real probability = contested. From
+    the yes3_arb block (deployed 2026-06-03)."""
+    y3 = fire.get("yes3_arb") if fire else None
+    if not y3:
+        return None
+    leader = y3.get("leader")
+    if not leader or leader.get("best_ask") is None:
+        return None
+    nb_asks = [float(nb["best_ask"]) for nb in (y3.get("neighbors") or [])
+               if nb and nb.get("best_ask") is not None]
+    if not nb_asks:
+        return None
+    return float(leader["best_ask"]) - max(nb_asks)
+
+
+def obs_margin(fire, target, unit, kind, thr):
+    """Degrees of headroom from the obs-so-far to the favorite bucket's KILL
+    boundary (mid buckets only — the bulk of busts). SMALL/negative = the
+    observed extreme is at/over the edge = imminent slip. From observed_extreme_c
+    (deployed 2026-06-02). max → headroom up to T+0.5; min → headroom down to
+    T−0.5. Rounding boundary is ±0.5 (floor(c+0.5))."""
+    if not fire or kind != "mid" or thr is None:
+        return None
+    oc = fire.get("observed_extreme_c")
+    if oc is None:
+        return None
+    obs_u = float(oc) if unit == "C" else float(oc) * 9.0 / 5.0 + 32.0
+    try:
+        t = int(thr)
+    except (TypeError, ValueError):
+        return None
+    if target == "max":
+        return (t + 0.5) - obs_u
+    if target == "min":
+        return obs_u - (t - 0.5)
+    return None
+
+
 def forecast_by_sk():
     """(sk) -> sorted [(issue_time, [(prob,label,threshold)...normalised])]."""
     fc = defaultdict(list)
@@ -121,6 +176,7 @@ def rate(label, items, pred):
 def main():
     resmap = sd.resolution_map()
     fc = forecast_by_sk()
+    sweep = sweep_fire_map()
 
     # favorite YES leg per event (first fill) — has kind/threshold/fill_price
     fires = {}
@@ -159,9 +215,12 @@ def main():
             deg_off = abs(int(ai) - int(fthr))  # |actual - fav threshold|, station unit
         except (TypeError, ValueError):
             pass
+        fire = sweep.get(k)
         recs.append({"sk": k, "sid": sid, "hit": hit, "fprice": fprice, "fc": m,
                      "actual": ai, "fthr": fthr, "fkind": fkind, "fb": fb,
-                     "deg_off": deg_off})
+                     "deg_off": deg_off,
+                     "nb_gap": neighbor_gap(fire),
+                     "obs_margin": obs_margin(fire, k[1], u, fkind, fthr)})
 
     n = len(recs)
     busts = [r for r in recs if not r["hit"]]
@@ -205,14 +264,33 @@ def main():
               "— the higher this is, the LESS the forecast can pre-flag the bust"
               % (len(fbusts), agreed_busts, 100 * agreed_busts / len(fbusts) if fbusts else 0))
 
+    # ---- signal 3: MARKET neighbor gap (yes3_arb) — accumulating ----
+    gr = [r for r in recs if r["nb_gap"] is not None]
+    print("\n[3] MARKET neighbor gap at fire (fav ask − max ±1-neighbor ask; SMALL = contested)")
+    print("    matched to yes3_arb: %d of %d  (deployed 2026-06-03 — accumulating)" % (len(gr), n))
+    if gr:
+        grp("neighbor gap", [r["nb_gap"] for r in gr if r["hit"]], [r["nb_gap"] for r in gr if not r["hit"]])
+
+    # ---- signal 4: OBS-boundary margin (observed_extreme_c) — accumulating ----
+    om = [r for r in recs if r["obs_margin"] is not None]
+    print("\n[4] OBS-boundary margin at fire (° from obs-so-far to kill boundary, mid buckets; SMALL=imminent)")
+    print("    matched to observed_extreme_c: %d of %d  (deployed 2026-06-02 — accumulating)" % (len(om), n))
+    if om:
+        grp("obs margin", [r["obs_margin"] for r in om if r["hit"]], [r["obs_margin"] for r in om if not r["hit"]], fmt="%+.2f")
+
     # ---- per-bust detail ----
     print("\nBUSTS (favorite lost):")
     for r in sorted(busts, key=lambda r: r["fprice"]):
         fcs = ("p_fav=%.2f top2=%+.2f agree=%s dist=%s" % (
             r["fc"]["p_fav"], r["fc"]["top2"], r["fc"]["agree"], r["fc"]["dist"])) if r["fc"] else "no-forecast"
-        print("  %-5s %-3s %s  fav '%s'@%.2f actual=%s (|off|=%s)  %s"
+        extra = ""
+        if r["nb_gap"] is not None:
+            extra += " gap=%+.2f" % r["nb_gap"]
+        if r["obs_margin"] is not None:
+            extra += " obsM=%+.2f" % r["obs_margin"]
+        print("  %-5s %-3s %s  fav '%s'@%.2f actual=%s (|off|=%s)  %s%s"
               % (r["sk"][0], r["sk"][1], r["sk"][2][5:], r["fb"], r["fprice"],
-                 r["actual"], r["deg_off"], fcs))
+                 r["actual"], r["deg_off"], fcs, extra))
     print("\nNotes: forecast use is MEASUREMENT-only (TRADING gated N>=30). Market-implied")
     print("  neighbor gap (yes3_arb) + obs-boundary proximity (observed_extreme_c) are the")
     print("  mechanically strongest signals — add here once those logs accumulate.")
