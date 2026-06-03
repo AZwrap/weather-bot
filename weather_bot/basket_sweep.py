@@ -123,6 +123,70 @@ def _leg_snapshot(*, m, side: str, depth, observed_ask: float | None,
     }
 
 
+def _ask_ladder(depth, max_levels: int = 8) -> list[list[float]]:
+    """Top `max_levels` of a YES ask ladder as [[price, shares], ...]
+    (cheapest-first). Lets the analyzer size a matched-share arb against
+    the REAL book instead of assuming infinite depth at top-of-book —
+    the failure that produced the fake $5000 fill in the first 3-bucket
+    test. Empty when there's no book."""
+    if depth is None or not depth.asks:
+        return []
+    return [[round(lv.price, 4), round(lv.size_shares, 2)] for lv in depth.asks[:max_levels]]
+
+
+def _yes_arb_leg(m, depth, size_usd: float) -> dict | None:
+    """One YES leg of the 3-bucket arb (the favorite or a ±1 neighbor):
+    best ask, the ask ladder (for depth-aware matched-share sizing), and a
+    $size_usd depth-walk for a quick read. None if the bucket can't parse."""
+    if m is None:
+        return None
+    try:
+        kind, thr = parse_bucket(m)
+    except (ValueError, TypeError, KeyError):
+        return None
+    best_ask = None
+    if depth is not None and depth.asks:
+        best_ask = round(depth.asks[0].price, 4)
+    elif m.yes_ask is not None:
+        best_ask = float(m.yes_ask)
+    fill = None
+    sim = simulate_buy_fill(depth, size_usd, 0.99)
+    if sim is not None:
+        fa, sh, fully = sim
+        fill = {"fill_price": fa, "shares": round(sh, 2), "fully_filled": fully}
+    return {
+        "bucket_label": m.bucket_label,
+        "bucket_kind": kind,
+        "bucket_threshold": int(thr),
+        "best_ask": best_ask,
+        "ask_ladder": _ask_ladder(depth),
+        "fill_5usd": fill,
+    }
+
+
+def _neighbor_markets(ev, leader) -> list:
+    """The leader's two threshold-adjacent buckets (fav−1, fav+1) — the
+    off-by-one buckets the 3-bucket hedge buys YES on. Found by sorting all
+    buckets by threshold and taking the leader's index ±1, so it's
+    unit-agnostic (°C 1° steps and °F 2° steps both work)."""
+    parsed = []
+    for m in ev.markets:
+        try:
+            _k, t = parse_bucket(m)
+        except (ValueError, TypeError, KeyError):
+            continue
+        parsed.append((int(t), m))
+    parsed.sort(key=lambda x: x[0])
+    li = next((i for i, (_t, m) in enumerate(parsed) if m is leader), None)
+    if li is None:
+        return []
+    out = []
+    for j in (li - 1, li + 1):
+        if 0 <= j < len(parsed):
+            out.append(parsed[j][1])
+    return out
+
+
 def _fresh_yes_ask(m, book_cache) -> float | None:
     """Leading-bucket trigger price. Prefer the WS cache's best ask
     (refreshed sub-second on every price_change delta); fall back to the
@@ -207,10 +271,18 @@ async def log_basket_sweep(
             continue
 
         # New high-water penny reached — fetch depth and snapshot the basket.
+        # 3-bucket arb: also pull the two threshold-neighbors' YES books so
+        # we can measure how often the favorite ±1 YES asks sum < $1 (the
+        # arb gate the operator requires — only then is the hedge +EV) and
+        # how many shares actually fill at that price.
+        neighbors = _neighbor_markets(ev, leader)
         tokens = [leader.yes_token_id]
         for m in ev.markets:
             if m is not leader and m.no_token_id:
                 tokens.append(m.no_token_id)
+        for nm in neighbors:
+            if nm.yes_token_id and nm.yes_token_id not in tokens:
+                tokens.append(nm.yes_token_id)
         try:
             depth_map = await fetch_orderbook_depths_batch(tokens, http)
         except Exception:
@@ -267,6 +339,27 @@ async def log_basket_sweep(
         if extreme_state is not None:
             observed_extreme_c = extreme_state.get((station.station_id, target, td_iso))
 
+        # 3-bucket arb snapshot: leader YES + the two threshold-neighbors'
+        # YES, each with its ask ladder. The hedge (buy YES on fav±1 too) is
+        # only +EV when these three asks sum < $1 — then you pay <$1 for a
+        # basket that wins ~99% (the off-by-one is covered), an empirical
+        # arb. The analyzer sizes it depth-aware (equal shares across the 3,
+        # bounded by the thinnest book) and scores it on the real winner.
+        leader_arb = _yes_arb_leg(leader, depth_map.get(leader.yes_token_id), size_usd)
+        neigh_arb = [a for a in (
+            _yes_arb_leg(nm, depth_map.get(nm.yes_token_id), size_usd)
+            for nm in neighbors) if a is not None]
+        best_asks = [a["best_ask"] for a in ([leader_arb] + neigh_arb)
+                     if a is not None and a["best_ask"] is not None]
+        best_sum = round(sum(best_asks), 4) if len(best_asks) == 3 else None
+        yes3_arb = {
+            "leader": leader_arb,
+            "neighbors": neigh_arb,
+            "n_yes_legs": (1 if leader_arb else 0) + len(neigh_arb),
+            "best_ask_sum": best_sum,                # arb gate: <1.0 ⇒ +EV
+            "arb_ok": (best_sum is not None and best_sum < 1.0),
+        }
+
         _log({
             "ts_utc": now_dt.isoformat(),
             "station_id": station.station_id,
@@ -279,6 +372,7 @@ async def log_basket_sweep(
             "hours_to_midend": hours_to_midend, # time-gate: hrs to window-end
             "leader_dwell_s": leader_dwell_s,   # stability-gate: leader dwell
             "observed_extreme_c": observed_extreme_c,  # obs max/min so far (roll death-signal)
+            "yes3_arb": yes3_arb,               # 3-bucket arb gate (fav±1 YES ladders)
             "winner": winner,                   # None only if winner book vanished
             "fade_no": fade_no,
             "n_no_legs": len(fade_no),
