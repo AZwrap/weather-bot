@@ -236,6 +236,19 @@ def compute(resmap=None) -> dict:
     positions = compute_positions(resmap)
     today = datetime.now(timezone.utc).date().isoformat()
 
+    # Prune unresolvable ZOMBIE open positions on excluded dodgy-source stations
+    # (Istanbul/Moscow/Tel Aviv/etc. resolve on weather.gov/NOAA/HKO, not our WUG
+    # oracle, so they can NEVER resolve and would hang "open" forever, cluttering
+    # the view). They're already dropped from all P&L analysis; this just hides
+    # them from the open list. Count is surfaced in health.n_open_excluded.
+    _excl_raw = load_json(DATA / "excluded_stations.json") or []
+    _excl_ids = {r.get("station_id") for r in _excl_raw if isinstance(r, dict)} \
+        if isinstance(_excl_raw, list) else set()
+    n_open_excluded = sum(1 for p in positions
+                          if p["status"] == "open" and p["station"] in _excl_ids)
+    positions = [p for p in positions
+                 if not (p["status"] == "open" and p["station"] in _excl_ids)]
+
     all_agg = _agg(positions, today)
     by_strategy = {}
     for strat in STRATEGIES:
@@ -296,6 +309,7 @@ def compute(resmap=None) -> dict:
         "flags": flags,
         "taker_fee_rate": fee_cfg.get("taker_fee_rate"),
         "n_excluded": len(excluded),
+        "n_open_excluded": n_open_excluded,
         "excluded": excluded,
     }
 
