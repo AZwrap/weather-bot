@@ -90,14 +90,22 @@ def _station_local_date_iso(station_timezone: str) -> str | None:
     return datetime.now(tz).date().isoformat()
 
 
-HARD_CAP_PRICE = 0.99
-"""Maximum we'll pay for NO on a confirmed-dead bucket. Above this,
-expected EV turns negative once oracle-dispute / data-revision risk
-(≤2% failure) is priced in.
+HARD_CAP_PRICE = 1.00
+"""Maximum we'll pay for NO on a confirmed-dead bucket.
 
-CHANGED 2026-05-18 from $0.98 → $0.99 to unblock 5.5% of Layer 7
-evaluations that were `skipped_ask_high` at $0.98. Stays 2-decimal
-clean (Polymarket maker_amount precision requirement)."""
+CHANGED 2026-06-03 (operator, PAPER) from $0.99 → $1.00 = cap REMOVED, fire at
+any price. Thesis: the historical ~8% guarantee-failures were source-mismatch +
+°F↔°C rounding, both now fixed (native-unit WUG fetch + dodgy-station
+exclusions), so a confirmed-dead bucket's NO is ~certain to redeem at $1 — buy
+it at any price for the (tiny) guaranteed win. Dead-bucket NO is priced 0.995-
+1.000, so at $0.99 Layer 7 filled ~nothing. THIS IS THE TEST: with the cap off
+it will now fill; WATCH the realized REDEEM RATE at N. Breakeven redeem = the
+fill price, so at ~0.999 prices it needs ~99.9% redeem to not bleed; one
+residual failure (spurious obs spike / intraday-vs-daily divergence / boundary
+rounding) per few-hundred fills makes it net-negative. PAPER only. 2-decimal
+clean (Polymarket maker_amount precision).
+
+(history) 2026-05-18: $0.98 → $0.99 to unblock 5.5% of skipped_ask_high evals."""
 
 MIN_NO_ASK_SANITY = 0.80
 """SANITY GATE (added 2026-05-21 after catastrophic bug):
