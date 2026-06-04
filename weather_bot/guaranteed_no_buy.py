@@ -1029,6 +1029,12 @@ def detect_and_execute_guaranteed_buys(
             "fast_path": used_presigned,  # True if broadcast pre-signed (saves ~200ms)
             "depth_source": depth_source,    # "depth_walk" | "top_of_book"
             "fully_filled": fully_filled,    # False = depth ran out, partial fill
+            # Scoring fields (added 2026-06-03) so the dashboard's generic P&L
+            # engine can resolve Layer 7 NO legs like the other strategies
+            # (target/kind/threshold; threshold in the station's unit).
+            "target": target,
+            "bucket_kind": kind,
+            "bucket_threshold": int(thr),
             "result": "filled",
         }, log_path)
 

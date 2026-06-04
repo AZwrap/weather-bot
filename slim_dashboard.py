@@ -39,6 +39,7 @@ STRATEGIES = {
     "consensus_basket": {"log": "consensus_basket_log.jsonl", "side": None, "label": "Consensus basket"},
     "high_bucket_no":   {"log": "high_bucket_no_log.jsonl",   "side": "NO", "label": "High-bucket NO"},
     "persistence_tail": {"log": "persistence_tail_log.jsonl", "side": "NO", "label": "Persistence tail"},
+    "layer7":           {"log": "guaranteed_no_buy_log.jsonl", "side": "NO", "label": "Layer 7 (guaranteed NO)"},
 }
 
 
@@ -188,7 +189,12 @@ def compute_positions(resmap) -> list[dict]:
             sid = r.get("station_id"); target = r.get("target"); date = r.get("target_date")
             kind = r.get("bucket_kind"); thr = r.get("bucket_threshold")
             shares = r.get("shares"); fill = r.get("fill_price")
-            if shares is None or fill is None:
+            # Skip unscoreable rows. Legacy Layer 7 fills (pre-2026-06-03) lack
+            # target/kind/threshold; without them the engine can't resolve them
+            # and they'd show as permanently-open zombies. The other strategy
+            # logs always carry all three, so this only drops the old L7 rows.
+            if (shares is None or fill is None or kind is None
+                    or thr is None or target is None):
                 continue
             key = (strat, sid, target, date, kind, thr, side)
             if key in seen:
