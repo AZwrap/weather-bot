@@ -73,6 +73,32 @@ this is a live A/B of the better-measured trigger, not a proven edge."""
 SIZE_USD: float = 5.0
 """Per-leg notional (winner YES + each loser NO)."""
 
+# ── Near-certain-corner restriction (2026-06-07, operator) ──────────────────
+# N=9 paper gate: the fade-basket bled across ALL fires (−$532), and the only
+# +EV subset is near-locked favorites, late-day, region-capped. So restrict
+# firing to that corner (trigger BAND + max-target time-gate + region cap).
+# PAPER unchanged. Re-widen by editing these constants.
+BAND_LO: float = 0.88     # fire only when winner YES ask in [BAND_LO, BAND_HI]
+BAND_HI: float = 0.94     # below = too contested; above = already locked / no edge
+MIN_LOCAL_HOUR: int = 16  # max-target only: skip fires before this station-local hour
+REGION_CAP_K: int = 3     # max concurrent same-region baskets per target_date
+
+
+def _station_local_hour(station) -> "int | None":
+    """Current station-local hour (now), via station.timezone; longitude fallback."""
+    now = datetime.now(timezone.utc)
+    tzname = getattr(station, "timezone", None)
+    if tzname:
+        try:
+            from zoneinfo import ZoneInfo
+            return now.astimezone(ZoneInfo(tzname)).hour
+        except Exception:
+            pass
+    lon = getattr(station, "longitude", None)
+    if lon is not None:
+        return int((now.hour + lon / 15.0) % 24)
+    return None
+
 YES_SLIPPAGE_TICKS: float = 0.02
 """How far above the winner's current YES ask we'll let the taker walk
 (don't chase the price up — 'go up the shares', not up the price)."""
@@ -239,6 +265,14 @@ async def detect_and_execute_consensus_basket(
             continue
         td_iso = td.isoformat()
 
+        # Time-gate: MAX-target busts cluster at midday formation — only fire
+        # after MIN_LOCAL_HOUR station-local. min-targets are unaffected.
+        if target == "max":
+            _lh = _station_local_hour(station)
+            if _lh is not None and _lh < MIN_LOCAL_HOUR:
+                counts["skipped_too_early_local"] += 1
+                continue
+
         # Event token set (for per-event dedupe; disjoint between max/min).
         event_tokens: set[str] = set()
         for m in ev.markets:
@@ -258,8 +292,12 @@ async def detect_and_execute_consensus_basket(
             if ya > winner_ya:
                 winner = m
                 winner_ya = ya
-        if winner is None or winner_ya < trigger_yes:
+        if winner is None:
             counts["skipped_no_winner"] += 1
+            continue
+        # Trigger BAND (not just a floor): fire only on near-locked favorites.
+        if not (BAND_LO <= winner_ya <= BAND_HI):
+            counts["skipped_below_band" if winner_ya < BAND_LO else "skipped_above_band"] += 1
             continue
         if not winner.yes_token_id:
             counts["skipped_winner_no_token"] += 1
@@ -267,6 +305,20 @@ async def detect_and_execute_consensus_basket(
         attempt_key = f"{station.station_id}|{target}|{td_iso}"
         if attempted.get(attempt_key) == "locked" or _already_placed(portfolio, event_tokens):
             counts["skipped_already_placed"] += 1
+            continue
+
+        # Region cap: don't let one synoptic front load up >K same-region
+        # baskets on the same target_date (correlated-bust mitigation).
+        _reg = region_for(station.station_id)
+        _open_reg = sum(
+            1 for p in portfolio.positions
+            if getattr(p, "strategy", "") == "consensus_basket"
+            and getattr(p, "side", "") == "YES"
+            and getattr(p, "target_date", "") == td_iso
+            and getattr(p, "region", "") == _reg
+        )
+        if _open_reg >= REGION_CAP_K:
+            counts["skipped_region_cap"] += 1
             continue
 
         # Fetch depth for the legs we'll trade: winner YES + every other NO.
