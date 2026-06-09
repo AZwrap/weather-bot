@@ -58,13 +58,18 @@ DISPLAY_STRATEGIES = {
 
 # ─────────────────────────────────────────── loaders
 
-def load_jsonl(path: Path) -> list[dict]:
+def load_jsonl(path: Path, must_contain: str | None = None) -> list[dict]:
     out: list[dict] = []
     if not path.exists():
         return out
     try:
         with path.open("r", encoding="utf-8") as fh:
             for line in fh:
+                # Cheap substring pre-filter — skip json.loads on irrelevant lines.
+                # Layer 7 logs 280k+ skip rows; we only want the ~50 filled ones,
+                # so this takes compute() from ~56s to ~1s.
+                if must_contain is not None and must_contain not in line:
+                    continue
                 line = line.strip()
                 if not line:
                     continue
@@ -195,7 +200,7 @@ def compute_positions(resmap) -> list[dict]:
     rows: list[dict] = []
     seen = set()
     for strat, cfg in STRATEGIES.items():
-        for r in load_jsonl(DATA / cfg["log"]):
+        for r in load_jsonl(DATA / cfg["log"], must_contain='"result": "filled"'):
             if r.get("result") != "filled":
                 continue
             side = r.get("side") or cfg["side"] or "NO"
