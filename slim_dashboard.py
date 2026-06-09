@@ -42,6 +42,19 @@ STRATEGIES = {
     "layer7":           {"log": "guaranteed_no_buy_log.jsonl", "side": "NO", "label": "Layer 7 (guaranteed NO)"},
 }
 
+# consensus_basket was RESTRICTED to the near-certain corner on 2026-06-08 11:40
+# UTC. Split the DASHBOARD view (only) so the restricted model's P&L isn't buried
+# in the legacy pre-restriction bleed. Rows with fire ts >= cutoff = "restricted".
+# compute_positions() stays unchanged (analyzers keep seeing 'consensus_basket').
+RESTRICT_CUTOFF = "2026-06-08T11:40"
+DISPLAY_STRATEGIES = {
+    "basket_restricted": "Basket - restricted",
+    "basket_legacy":     "Basket - legacy",
+    "high_bucket_no":    "High-bucket NO",
+    "persistence_tail":  "Persistence tail",
+    "layer7":            "Layer 7 (guaranteed NO)",
+}
+
 
 # ─────────────────────────────────────────── loaders
 
@@ -255,11 +268,17 @@ def compute(resmap=None) -> dict:
     positions = [p for p in positions
                  if not (p["status"] == "open" and p["station"] in _excl_ids)]
 
+    # Split consensus_basket into legacy vs restricted by fire ts (dashboard-only).
+    for p in positions:
+        if p["strategy"] == "consensus_basket":
+            p["strategy"] = ("basket_restricted"
+                             if (p.get("ts") or "") >= RESTRICT_CUTOFF else "basket_legacy")
+
     all_agg = _agg(positions, today)
     by_strategy = {}
-    for strat in STRATEGIES:
+    for strat, label in DISPLAY_STRATEGIES.items():
         a = _agg([p for p in positions if p["strategy"] == strat], today)
-        a["label"] = STRATEGIES[strat]["label"]
+        a["label"] = label
         by_strategy[strat] = a
 
     activity = [{
@@ -323,7 +342,7 @@ def compute(resmap=None) -> dict:
         "generated_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "refresh_s": REFRESH_S,
         "health": health,
-        "pnl": {"all": all_agg, "by_strategy": by_strategy, "order": list(STRATEGIES.keys())},
+        "pnl": {"all": all_agg, "by_strategy": by_strategy, "order": list(DISPLAY_STRATEGIES.keys())},
         "positions": {
             "open": [p for p in positions if p["status"] == "open"][:500],
             "resolved": [p for p in positions if p["status"] == "resolved"][:500],
@@ -425,7 +444,7 @@ a.refresh{color:var(--accent);cursor:pointer;font-size:12px;text-decoration:none
 </main>
 <script>
 const TABS = ["Overview","Positions & P&L","Strategies","Resolutions","System"];
-const STRATS=[["all","All"],["consensus_basket","Basket"],["high_bucket_no","Hi-NO"],["persistence_tail","Tail"]];
+const STRATS=[["all","All"],["basket_restricted","Basket"],["basket_legacy","Basket(old)"],["high_bucket_no","Hi-NO"],["persistence_tail","Tail"],["layer7","L7"]];
 let TAB=0, D=null, FILTER="all";
 const SORTS={}, FOLDS={};
 
@@ -434,7 +453,7 @@ const cls=(v)=> v==null?"mut":(v>0?"pos":(v<0?"neg":"mut"));
 const pct=(v)=> v==null?"—":(v*100).toFixed(0)+"%";
 const esc=(s)=> (s==null?"":String(s)).replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
 const ago=(s)=> s==null?"—":((s<90?s+"s":(s<5400?Math.round(s/60)+"m":Math.round(s/3600)+"h"))+" ago");
-const sshort=(s)=> ({consensus_basket:"basket",high_bucket_no:"hi-NO",persistence_tail:"tail"}[s]||s);
+const sshort=(s)=> ({basket_restricted:"basket",basket_legacy:"basket-old",high_bucket_no:"hi-NO",persistence_tail:"tail",layer7:"L7"}[s]||s);
 const sidePill=(s)=> `<span class="pill ${s==="NO"?"no":"yes"}">${s}</span>`;
 const tmin=(t)=> esc((t||"").slice(5,16).replace("T"," "));
 const cur=()=> FILTER==="all"? D.pnl.all : D.pnl.by_strategy[FILTER];
