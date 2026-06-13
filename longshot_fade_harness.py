@@ -57,6 +57,8 @@ BASKET = {
 }
 
 LOG = Path("data/longshot_fade/signals.jsonl")
+TRAJ = Path("data/longshot_fade/trajectory.jsonl")  # per-open-position NO bid/ask path (resell sim)
+MAKER_REBATE_FRAC = 0.25  # 25% of taker fee redistributed to makers (fees.py)
 
 
 def _now_iso():
@@ -150,6 +152,7 @@ async def scan(live: bool):
 
             rec = {
                 "ts": _now_iso(), "mode": "live" if live else "dry",
+                "sig_id": f"{m.no_token_id}|{td.isoformat()}",
                 "city": st.name, "station_id": st.station_id, "target": st_target(ev),
                 "timing": timing,
                 "target_date": td.isoformat(), "bucket_label": m.bucket_label,
@@ -260,17 +263,67 @@ async def resolve():
     print(f"vs {PAPER_BENCHMARK}")
 
 
+async def track_open():
+    """Re-fetch the NO book for every still-open logged signal and append a bid/ask
+    tick to trajectory.jsonl — builds the price path used to simulate resell exits.
+    Runs automatically after each scan."""
+    if not LOG.exists():
+        return
+    today = datetime.now(timezone.utc).date()
+    open_sigs = {}
+    for line in LOG.read_text().splitlines():
+        try:
+            r = json.loads(line)
+        except Exception:
+            continue
+        sid = r.get("sig_id")
+        if not sid:
+            continue
+        try:
+            if date.fromisoformat(r["target_date"]) < today:   # matured -> stop tracking
+                continue
+        except Exception:
+            continue
+        open_sigs[sid] = r["no_token_id"]
+    if not open_sigs:
+        print("no open positions to track", file=sys.stderr)
+        return
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        books = await fetch_orderbook_depths_batch(list(set(open_sigs.values())), client)
+    ts = _now_iso()
+    n = 0
+    TRAJ.parent.mkdir(parents=True, exist_ok=True)
+    with TRAJ.open("a") as f:
+        for sid, tok in open_sigs.items():
+            b = books.get(tok)
+            if b is None:
+                continue
+            f.write(json.dumps({"sig_id": sid, "ts": ts,
+                                "no_bid": round(b.best_bid, 4) if b.best_bid else None,
+                                "no_ask": round(b.best_ask, 4) if b.best_ask else None}) + "\n")
+            n += 1
+    print(f"tracked {n} open positions -> {TRAJ}", file=sys.stderr)
+
+
 def main():
     ap = argparse.ArgumentParser(description="Longshot-fade live-test harness (dry-run default)")
     ap.add_argument("--live", action="store_true", help="submit real orders (needs funds+SDK+env)")
     ap.add_argument("--resolve", action="store_true", help="score matured logged signals")
+    ap.add_argument("--track-only", action="store_true", help="only update open-position trajectories")
     args = ap.parse_args()
     if args.resolve:
         asyncio.run(resolve())
+    elif args.track_only:
+        asyncio.run(track_open())
     else:
         if args.live:
             print("!! --live: real money. Ctrl-C now if unintended.", file=sys.stderr)
-        asyncio.run(scan(live=args.live))
+
+        async def _run():
+            await scan(live=args.live)
+            await track_open()
+
+        asyncio.run(_run())
 
 
 if __name__ == "__main__":

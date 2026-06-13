@@ -21,9 +21,11 @@ HOST, PORT = "127.0.0.1", 8765
 BASE = Path(__file__).resolve().parent / "data" / "longshot_fade"
 SIGNALS = BASE / "signals.jsonl"
 RESCACHE = BASE / "dash_resolutions.json"
+TRAJ = BASE / "trajectory.jsonl"
 GAMMA = "https://gamma-api.polymarket.com/markets"
 REFRESH_SEC = 600
 PAPER_WIN, PAPER_ROI = 97.0, 20.0  # the bar to beat
+MAKER_REBATE_FRAC, RESELL_T = 0.25, 0.95  # maker rebate frac; resell take-profit target
 
 _state = {"html": "<h1 style='color:#ccc;font-family:sans-serif'>starting…</h1>"}
 _lock = threading.Lock()
@@ -140,6 +142,32 @@ def compute():
     for r, w, p, e in settled:
         t = tg[r.get("timing", "?")]
         t["set"] += 1; t["win"] += 1 if w else 0; t["dep"] += e; t["pnl"] += p
+    # variant grid: entry {taker=ask, maker=bid} x exit {hold, resell@T}
+    traj_max = {}
+    if TRAJ.exists():
+        for line in TRAJ.read_text().splitlines():
+            try:
+                tk = json.loads(line)
+            except Exception:
+                continue
+            b, sid = tk.get("no_bid"), tk.get("sig_id")
+            if b is not None and sid:
+                traj_max[sid] = max(traj_max.get(sid, 0.0), b)
+    variants = {k: {"dep": 0.0, "pnl": 0.0, "n": 0, "exit": 0}
+                for k in ("taker-hold", "maker-hold", "taker-resell", "maker-resell")}
+    for r, w, _, _ in settled:
+        won = 1.0 if w else 0.0
+        ask, bid = r.get("decision_quote"), r.get("no_best_bid")
+        resold = traj_max.get(r.get("sig_id"), 0.0) >= RESELL_T
+        ex = RESELL_T if resold else won
+        if ask:
+            fee = 0.05 * ask * (1 - ask)
+            v = variants["taker-hold"]; v["dep"] += ask; v["pnl"] += (won - ask) - fee; v["n"] += 1
+            v = variants["taker-resell"]; v["dep"] += ask; v["pnl"] += (ex - ask) - fee; v["n"] += 1; v["exit"] += resold
+        if bid:
+            reb = MAKER_REBATE_FRAC * 0.05 * bid * (1 - bid)
+            v = variants["maker-hold"]; v["dep"] += bid; v["pnl"] += (won - bid) + reb; v["n"] += 1
+            v = variants["maker-resell"]; v["dep"] += bid; v["pnl"] += (ex - bid) + reb; v["n"] += 1; v["exit"] += resold
     dates = sorted({r.get("target_date") for r in recs})
     return {
         "n": len(recs), "cities": len({r.get("city") for r in recs}),
@@ -150,6 +178,7 @@ def compute():
         "mean_gap": (sum(gaps) / len(gaps)) if gaps else None,
         "city": city,
         "timing": tg,
+        "variants": variants,
         "recent": recs[-15:][::-1],
     }
 
@@ -199,6 +228,16 @@ def render(s):
         trows += (f"<tr><td>{tlabel}</td><td>{d['sig']}</td><td>{d['set']}</td>"
                   f"<td class='{_cls(wp,95,90) if wp is not None else ''}'>{f'{wp:.0f}%' if wp is not None else '—'}</td>"
                   f"<td class='{_cls(rp,15,0) if rp is not None else ''}'>{f'{rp:+.0f}%' if rp is not None else '—'}</td></tr>")
+    # variant grid (entry x exit)
+    vrows = ""
+    for k in ("taker-hold", "maker-hold", "taker-resell", "maker-resell"):
+        d = s["variants"].get(k)
+        if not d or not d["n"]:
+            continue
+        roi = (100 * d["pnl"] / d["dep"]) if d["dep"] else 0
+        ex = f" ({d['exit']} resold)" if "resell" in k else ""
+        vrows += (f"<tr><td>{k}{ex}</td><td>{d['n']}</td>"
+                  f"<td class='{_cls(roi,15,5)}'>{roi:+.1f}%</td></tr>")
     # recent table
     rrows = ""
     for r in s["recent"]:
@@ -215,6 +254,7 @@ def render(s):
             f"<div class=sub>NO @ 0.75–0.85 on the basket cities, held to resolution · no orders, no money · refreshed {now}</div>"
             f"<div class=kpis>{kpis}</div>"
             f"<h2>By timing — does same-day a.m. differ from next-day?</h2><table><tr><th>window</th><th>signals</th><th>settled</th><th>win%</th><th>roi</th></tr>{trows}</table>"
+            f"<h2>Variants — entry × exit  (maker = rest at bid, assumes fill; net fees/rebate)</h2><table><tr><th>strategy</th><th>settled</th><th>net ROI</th></tr>{vrows}</table>"
             f"<h2>By city</h2><table><tr><th>city</th><th>signals</th><th>settled</th><th>win%</th><th>roi</th></tr>{crows}</table>"
             f"<h2>Recent signals</h2><table><tr><th>utc</th><th>city</th><th>win</th><th>bucket</th><th>NO quote</th><th>fill-gap</th></tr>{rrows}</table>"
             f"</div></body></html>")
