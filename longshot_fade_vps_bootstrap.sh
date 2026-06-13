@@ -43,11 +43,11 @@ echo "[4/6] dry-run smoke test (no orders) ..."
 cd "$DIR"
 PYTHONUTF8=1 "$PY" longshot_fade_harness.py | tail -3
 
-echo "[5/7] install cron: scan every 8h, resolve daily 23:30 UTC ..."
+echo "[5/7] install cron: scan hourly, resolve daily 23:30 UTC ..."
 SCAN="cd $DIR && PYTHONUTF8=1 $PY longshot_fade_harness.py >> $DIR/data/longshot_fade/scan.log 2>&1"
 RES="cd $DIR && PYTHONUTF8=1 $PY longshot_fade_harness.py --resolve >> $DIR/data/longshot_fade/resolve_report.txt 2>&1"
 { crontab -l 2>/dev/null | grep -v 'longshot_fade_harness.py' || true
-  echo "0 */8 * * * $SCAN"
+  echo "0 * * * * $SCAN"
   echo "30 23 * * * $RES"
 } | crontab -
 
