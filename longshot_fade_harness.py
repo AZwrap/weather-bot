@@ -160,6 +160,7 @@ async def scan(live: bool):
                 "yes_token_id": m.yes_token_id, "event_slug": ev.slug,
                 "decision_quote": round(no_ask, 4),
                 "no_best_bid": round(book.best_bid, 4) if book.best_bid else None,
+                "maker_queue_ahead": round(book.bids[0].size_shares, 1) if book.bids else None,
                 "no_spread": round(book.spread, 4) if book.spread is not None else None,
                 "sim_avg_fill": round(sim_fill, 4) if sim_fill else None,
                 "sim_shares": round(sim_sh, 2), "sim_fully_filled": sim_full,
