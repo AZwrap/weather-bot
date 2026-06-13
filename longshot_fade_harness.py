@@ -37,6 +37,7 @@ from weather_bot.polymarket import (
     match_event_to_station, parse_bucket, event_target_date,
     GAMMA_BASE,
 )
+from weather_bot.fees import taker_fee_usd  # weather taker fee = shares·0.05·p·(1−p)
 
 # ── Basket spec (from sharpen_basket.py) ──────────────────────────────────────
 BAND_LO, BAND_HI = 0.75, 0.85       # NO entry-price sweet spot (+16-18pp, 96-99% win)
@@ -160,6 +161,7 @@ async def scan(live: bool):
                 "sim_avg_fill": round(sim_fill, 4) if sim_fill else None,
                 "sim_shares": round(sim_sh, 2), "sim_fully_filled": sim_full,
                 "fill_gap": round(sim_fill - no_ask, 4) if sim_fill else None,
+                "taker_fee": round(taker_fee_usd(sim_sh, sim_fill), 5) if sim_fill else 0.0,
                 "size_usd": SIZE_USD,
             }
 

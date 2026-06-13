@@ -114,7 +114,8 @@ def compute():
             continue
         entry = r.get("decision_quote") or 0.0
         no_won = res == "no"
-        pnl = (1.0 - entry) if no_won else -entry
+        fee = 0.05 * entry * (1.0 - entry)  # weather taker fee per share: 0.05·p·(1−p)
+        pnl = ((1.0 - entry) if no_won else -entry) - fee
         settled.append((r, no_won, pnl, entry))
     if changed:
         RESCACHE.parent.mkdir(parents=True, exist_ok=True)
@@ -174,7 +175,7 @@ def render(s):
         f"<div class=note>{s['maturing']} still maturing</div></div>"
         f"<div class=kpi><div class=lbl>NO-win rate</div><div class='val {_cls(win,95,90)}'>{wintxt}</div>"
         f"<div class=note>paper bar {PAPER_WIN:.0f}%</div><div class=bar><i class='{_cls(win,95,90)}' style='width:{wbar:.0f}%;background:currentColor'></i></div></div>"
-        f"<div class=kpi><div class=lbl>Realized ROI / mkt</div><div class='val {_cls(roi,15,5)}'>{roitxt}</div>"
+        f"<div class=kpi><div class=lbl>Realized ROI / mkt (net fees)</div><div class='val {_cls(roi,15,5)}'>{roitxt}</div>"
         f"<div class=note>paper bar +{PAPER_ROI:.0f}%</div></div>"
         f"<div class=kpi><div class=lbl>Fill-gap (sim)</div><div class=val>{gaptxt}</div>"
         f"<div class=note>quote→fill slippage</div></div>"
