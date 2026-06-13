@@ -132,6 +132,13 @@ def compute():
     for r, w, p, e in settled:
         c = city[r.get("city", "?")]
         c["set"] += 1; c["win"] += 1 if w else 0; c["dep"] += e; c["pnl"] += p
+    # per-timing window (next_day vs same_day_am) — the comparison
+    tg = defaultdict(lambda: {"sig": 0, "set": 0, "win": 0, "dep": 0.0, "pnl": 0.0})
+    for r in recs:
+        tg[r.get("timing", "?")]["sig"] += 1
+    for r, w, p, e in settled:
+        t = tg[r.get("timing", "?")]
+        t["set"] += 1; t["win"] += 1 if w else 0; t["dep"] += e; t["pnl"] += p
     dates = sorted({r.get("target_date") for r in recs})
     return {
         "n": len(recs), "cities": len({r.get("city") for r in recs}),
@@ -141,6 +148,7 @@ def compute():
         "roi_pct": (100 * pnl / dep) if dep else None,
         "mean_gap": (sum(gaps) / len(gaps)) if gaps else None,
         "city": city,
+        "timing": tg,
         "recent": recs[-15:][::-1],
     }
 
@@ -179,12 +187,24 @@ def render(s):
         crows += (f"<tr><td>{c}</td><td>{d['sig']}</td><td>{d['set']}</td>"
                   f"<td class='{_cls(wp,95,90) if wp is not None else ''}'>{f'{wp:.0f}%' if wp is not None else '—'}</td>"
                   f"<td class='{_cls(rp,15,0) if rp is not None else ''}'>{f'{rp:+.0f}%' if rp is not None else '—'}</td></tr>")
+    # timing comparison table (next_day vs same_day_am)
+    trows = ""
+    for tkey, tlabel in (("next_day", "next-day (pure forward)"), ("same_day_am", "same-day a.m. (pre-peak)")):
+        d = s["timing"].get(tkey)
+        if not d:
+            continue
+        wp = (100 * d["win"] / d["set"]) if d["set"] else None
+        rp = (100 * d["pnl"] / d["dep"]) if d["dep"] else None
+        trows += (f"<tr><td>{tlabel}</td><td>{d['sig']}</td><td>{d['set']}</td>"
+                  f"<td class='{_cls(wp,95,90) if wp is not None else ''}'>{f'{wp:.0f}%' if wp is not None else '—'}</td>"
+                  f"<td class='{_cls(rp,15,0) if rp is not None else ''}'>{f'{rp:+.0f}%' if rp is not None else '—'}</td></tr>")
     # recent table
     rrows = ""
     for r in s["recent"]:
         ts = (r.get("ts", "") or "")[11:16]
         gap = r.get("fill_gap")
-        rrows += (f"<tr><td>{ts}</td><td>{r.get('city','?')}</td><td>{r.get('bucket_label','?')}</td>"
+        win = "nd" if r.get("timing") == "next_day" else ("am" if r.get("timing") == "same_day_am" else "?")
+        rrows += (f"<tr><td>{ts}</td><td>{r.get('city','?')}</td><td>{win}</td><td>{r.get('bucket_label','?')}</td>"
                   f"<td>${r.get('decision_quote',0):.3f}</td>"
                   f"<td>{f'{gap:+.3f}' if isinstance(gap,(int,float)) else '—'}</td></tr>")
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -193,8 +213,9 @@ def render(s):
             f"<h1>Longshot-fade forward test <span class=m>· paper</span></h1>"
             f"<div class=sub>NO @ 0.75–0.85 on the basket cities, held to resolution · no orders, no money · refreshed {now}</div>"
             f"<div class=kpis>{kpis}</div>"
+            f"<h2>By timing — does same-day a.m. differ from next-day?</h2><table><tr><th>window</th><th>signals</th><th>settled</th><th>win%</th><th>roi</th></tr>{trows}</table>"
             f"<h2>By city</h2><table><tr><th>city</th><th>signals</th><th>settled</th><th>win%</th><th>roi</th></tr>{crows}</table>"
-            f"<h2>Recent signals</h2><table><tr><th>utc</th><th>city</th><th>bucket</th><th>NO quote</th><th>fill-gap</th></tr>{rrows}</table>"
+            f"<h2>Recent signals</h2><table><tr><th>utc</th><th>city</th><th>win</th><th>bucket</th><th>NO quote</th><th>fill-gap</th></tr>{rrows}</table>"
             f"</div></body></html>")
 
 

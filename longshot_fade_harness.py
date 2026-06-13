@@ -42,6 +42,7 @@ from weather_bot.polymarket import (
 BAND_LO, BAND_HI = 0.75, 0.85       # NO entry-price sweet spot (+16-18pp, 96-99% win)
 SIZE_USD = 5.0                       # per-bucket taker size (min-stake)
 MAX_PER_CITY_PER_DAY = 4             # diversification cap
+PEAK_HOUR = {"highest": 13, "lowest": 5}  # local hour before which the daily extreme isn't set yet
 PAPER_BENCHMARK = "paper: ~97% win, ~+20% ROI/mkt — the bar live fills must clear"
 
 # Strong, +edge, CLEAN-oracle °C cities (Station.name.lower()). Oracle-risky
@@ -122,11 +123,16 @@ async def scan(live: bool):
             if not (BAND_LO <= no_ask <= BAND_HI):
                 continue
             td = event_target_date(ev, st)
-            # Forward-only: skip if the target weather day has already begun (or passed)
-            # in the city's LOCAL tz — else we'd log near-determined outcomes (e.g. an
-            # Asian market whose local day is already over while it's still "today" in
-            # UTC). A genuine forward bet is placed before the local day starts.
-            if datetime.now(ZoneInfo(st.timezone)).date() >= td:
+            # Forward-only, TAGGED so we can compare two pre-outcome windows:
+            #   next_day    = target day is a future local day (pure forward)
+            #   same_day_am = target day is today local, before the daily peak (still
+            #                 pre-outcome). Skip post-peak / past-day (that's lookahead).
+            local_now = datetime.now(ZoneInfo(st.timezone))
+            if td > local_now.date():
+                timing = "next_day"
+            elif td == local_now.date() and local_now.hour < PEAK_HOUR.get(st_target(ev), 12):
+                timing = "same_day_am"
+            else:
                 n_not_forward += 1
                 continue
             key = (m.no_token_id, td.isoformat())
@@ -144,6 +150,7 @@ async def scan(live: bool):
             rec = {
                 "ts": _now_iso(), "mode": "live" if live else "dry",
                 "city": st.name, "station_id": st.station_id, "target": st_target(ev),
+                "timing": timing,
                 "target_date": td.isoformat(), "bucket_label": m.bucket_label,
                 "kind": kind, "threshold": thr, "no_token_id": m.no_token_id,
                 "yes_token_id": m.yes_token_id, "event_slug": ev.slug,
