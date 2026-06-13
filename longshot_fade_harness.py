@@ -26,6 +26,7 @@ Run dry-run (reusable; schedule it a few×/day to accumulate):
 from __future__ import annotations
 import argparse, asyncio, json, sys
 from datetime import datetime, timezone, date
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 import httpx
@@ -112,6 +113,7 @@ async def scan(live: bool):
             live_client = _build_live_client()
 
         emitted = 0
+        n_not_forward = 0
         for st, ev, m in pre:
             book = books.get(m.no_token_id)
             if book is None or book.best_ask is None:
@@ -120,6 +122,13 @@ async def scan(live: bool):
             if not (BAND_LO <= no_ask <= BAND_HI):
                 continue
             td = event_target_date(ev, st)
+            # Forward-only: skip if the target weather day has already begun (or passed)
+            # in the city's LOCAL tz — else we'd log near-determined outcomes (e.g. an
+            # Asian market whose local day is already over while it's still "today" in
+            # UTC). A genuine forward bet is placed before the local day starts.
+            if datetime.now(ZoneInfo(st.timezone)).date() >= td:
+                n_not_forward += 1
+                continue
             key = (m.no_token_id, td.isoformat())
             if key in seen:
                 continue
@@ -160,6 +169,7 @@ async def scan(live: bool):
                   f"{'full' if sim_full else 'PARTIAL'} {sim_sh:.1f}sh)")
 
         print(f"\n{emitted} new signals logged -> {LOG}  [{'LIVE' if live else 'DRY-RUN'}]")
+        print(f"  (skipped {n_not_forward} non-forward: target day already started in city-local time)")
         print(f"{PAPER_BENCHMARK}")
 
 
