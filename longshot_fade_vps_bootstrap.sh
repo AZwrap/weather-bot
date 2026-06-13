@@ -33,10 +33,10 @@ else
   git clone -q -b "$BRANCH" "$REPO" "$DIR"
 fi
 
-echo "[3/6] python venv + deps (httpx numpy pandas)..."
+echo "[3/6] python venv + deps (httpx numpy pandas scipy)..."
 [ -d "$DIR/.venv" ] || python3 -m venv "$DIR/.venv"
 "$DIR/.venv/bin/pip" install -q --upgrade pip
-"$DIR/.venv/bin/pip" install -q httpx numpy pandas
+"$DIR/.venv/bin/pip" install -q httpx numpy pandas scipy
 mkdir -p "$DIR/data/longshot_fade"
 
 echo "[4/6] dry-run smoke test (no orders) ..."
