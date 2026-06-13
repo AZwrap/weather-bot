@@ -43,7 +43,7 @@ echo "[4/6] dry-run smoke test (no orders) ..."
 cd "$DIR"
 PYTHONUTF8=1 "$PY" longshot_fade_harness.py | tail -3
 
-echo "[5/6] install cron: scan every 8h, resolve daily 23:30 UTC ..."
+echo "[5/7] install cron: scan every 8h, resolve daily 23:30 UTC ..."
 SCAN="cd $DIR && PYTHONUTF8=1 $PY longshot_fade_harness.py >> $DIR/data/longshot_fade/scan.log 2>&1"
 RES="cd $DIR && PYTHONUTF8=1 $PY longshot_fade_harness.py --resolve >> $DIR/data/longshot_fade/resolve_report.txt 2>&1"
 { crontab -l 2>/dev/null | grep -v 'longshot_fade_harness.py' || true
@@ -51,10 +51,34 @@ RES="cd $DIR && PYTHONUTF8=1 $PY longshot_fade_harness.py --resolve >> $DIR/data
   echo "30 23 * * * $RES"
 } | crontab -
 
-echo "[6/6] DONE — forward test is live on this box."
-echo "  signals : $DIR/data/longshot_fade/signals.jsonl"
-echo "  watch   : tail -f $DIR/data/longshot_fade/scan.log"
-echo "  results : cat $DIR/data/longshot_fade/resolve_report.txt   (fills in once markets mature)"
-echo "  stop    : crontab -l | grep -v longshot_fade_harness.py | crontab -"
+echo "[6/7] dashboard systemd service on 127.0.0.1:8765 ..."
+cat > /etc/systemd/system/weatherbot-dash.service <<UNIT
+[Unit]
+Description=Weatherbot forward-test dashboard
+After=network.target
+[Service]
+WorkingDirectory=$DIR
+ExecStart=$PY $DIR/dashboard_forward.py
+Restart=always
+RestartSec=5
+[Install]
+WantedBy=multi-user.target
+UNIT
+systemctl daemon-reload
+systemctl enable -q weatherbot-dash.service
+systemctl restart weatherbot-dash.service
+sleep 1
+if systemctl is-active --quiet weatherbot-dash.service; then
+  echo "  dashboard ACTIVE -> http://127.0.0.1:8765"
+else
+  echo "  dashboard NOT active -- check: journalctl -u weatherbot-dash -n 20"
+fi
+
+echo "[7/7] DONE — forward test + dashboard live on this box (paper-only)."
+echo "  signals   : $DIR/data/longshot_fade/signals.jsonl"
+echo "  watch scan: tail -f $DIR/data/longshot_fade/scan.log"
+echo "  DASHBOARD : tunnel from your laptop, then open http://localhost:8765 :"
+echo "              ssh -L 8765:127.0.0.1:8765 root@199.247.29.13"
+echo "  stop all  : crontab -l|grep -v longshot_fade_harness.py|crontab -; systemctl disable --now weatherbot-dash"
 echo "--- installed cron ---"
 crontab -l | grep longshot_fade_harness.py
