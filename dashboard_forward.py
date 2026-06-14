@@ -306,11 +306,19 @@ def render(s):
     if mf:
         mkcls = "g" if mf.get("maker_total", 0) >= 0 else "r"
         tkcls = "g" if mf.get("taker_total", 0) >= 0 else "r"
+        dynrows = ""
+        if "dyn_fill_rate" in mf:
+            dmkcls = "g" if mf.get("dyn_maker_total", 0) >= 0 else "r"
+            dynrows = (
+                f"<tr><td><b>re-quoting maker fill</b></td><td>{mf['dyn_fill_rate']:.0f}%</td><td>win {mf['dyn_win_fill']:.0f}% / lose {mf['dyn_los_fill']:.0f}% - chase the touch</td></tr>"
+                f"<tr><td><b>re-quoting maker PnL</b></td><td class='{dmkcls}'><b>${mf['dyn_maker_total']:+.2f}</b></td><td>${mf['dyn_maker_per_sig']:+.3f}/signal (ub fill {mf['ub_fill_rate']:.0f}%)</td></tr>"
+            )
         mfrows = (
-            f"<tr><td>fill rate (overall)</td><td>{mf['fill_rate']:.0f}%</td><td>{mf['n']} settled</td></tr>"
-            f"<tr><td>fill rate, NO winners</td><td class=r>{mf['win_fill_rate']:.0f}%</td><td>{mf['win_filled']}/{mf['n_win']} - misses the wins</td></tr>"
-            f"<tr><td>fill rate, NO losers</td><td class=r>{mf['los_fill_rate']:.0f}%</td><td>{mf['los_filled']}/{mf['n_los']} - catches the losses</td></tr>"
-            f"<tr><td><b>maker PnL (measured fills)</b></td><td class='{mkcls}'><b>${mf['maker_total']:+.2f}</b></td><td>${mf['maker_per_sig']:+.3f}/signal</td></tr>"
+            f"<tr><td>static fill rate (overall)</td><td>{mf['fill_rate']:.0f}%</td><td>{mf['n']} settled</td></tr>"
+            f"<tr><td>static fill, NO winners</td><td class=r>{mf['win_fill_rate']:.0f}%</td><td>{mf['win_filled']}/{mf['n_win']} - misses the wins</td></tr>"
+            f"<tr><td>static fill, NO losers</td><td class=r>{mf['los_fill_rate']:.0f}%</td><td>{mf['los_filled']}/{mf['n_los']} - catches the losses</td></tr>"
+            f"<tr><td><b>static maker PnL</b></td><td class='{mkcls}'><b>${mf['maker_total']:+.2f}</b></td><td>${mf['maker_per_sig']:+.3f}/signal (rest once, no re-quote)</td></tr>"
+            + dynrows +
             f"<tr><td>taker PnL (always fills)</td><td class='{tkcls}'>${mf['taker_total']:+.2f}</td><td>${mf['taker_per_sig']:+.3f}/signal</td></tr>"
         )
         mfpanel = ("<h2>Maker fill - MEASURED (queue-aware, not assumed)</h2>"

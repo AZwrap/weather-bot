@@ -35,6 +35,7 @@ DATA = "https://data-api.polymarket.com/trades"
 LOG = Path("data/longshot_fade/signals.jsonl")
 CIDCACHE = Path("data/longshot_fade/cid_cache.json")
 RESCACHE = Path("data/longshot_fade/maker_rescache.json")
+TRAJ = Path("data/longshot_fade/trajectory.jsonl")
 REBATE = 0.25
 FEE = 0.05
 
@@ -112,6 +113,72 @@ def sim_fill(sells, B, Q, our_sh):
     return False, None
 
 
+def load_trajectory():
+    """sig_id -> time-sorted list of book ticks (no_bid, q_bid, ...)."""
+    traj = {}
+    if not TRAJ.exists():
+        return traj
+    for l in TRAJ.read_text().splitlines():
+        if not l.strip():
+            continue
+        try:
+            t = json.loads(l)
+        except Exception:
+            continue
+        sid = t.get("sig_id")
+        if sid and t.get("no_bid"):
+            traj.setdefault(sid, []).append(t)
+    for sid in traj:
+        traj[sid].sort(key=lambda x: x.get("ts", ""))
+    return traj
+
+
+def dynamic_fill(sig, sells, ticks, ignore_queue=False):
+    """Re-quoting maker: re-bid to the touch at each trajectory tick, FIFO fill.
+    Returns (filled, fill_bid, fill_ts). Resets queue progress on each re-quote
+    (we join the back of the new price level) and accumulates while the bid is
+    unchanged. Uses per-tick q_bid if logged, else the entry queue as a proxy.
+    With ignore_queue=True it's the upper bound (fill on the first sell at <= the
+    current touch). Chasing UP catches winners static misses; chasing DOWN can
+    duck the loser fills static eats."""
+    B0 = sig["no_best_bid"]
+    Q0 = sig["maker_queue_ahead"]
+    stake = sig.get("size_usd") or 5.0
+    entry = datetime.fromisoformat(sig["ts"]).timestamp()
+    path = [(entry, B0, Q0)]
+    for t in ticks:
+        try:
+            ts = datetime.fromisoformat(t["ts"]).timestamp()
+        except Exception:
+            continue
+        if ts > entry and t.get("no_bid"):
+            path.append((ts, t["no_bid"], t.get("q_bid")))
+    path.append((float("inf"), None, None))
+    ss = sorted(sells, key=lambda x: x["timestamp"])
+    si = 0
+    cum = 0.0
+    last_bid = None
+    for k in range(len(path) - 1):
+        ts_i, bid_i, q_i = path[k]
+        ts_next = path[k + 1][0]
+        if not bid_i:
+            continue
+        if bid_i != last_bid:           # re-quoted -> re-join the new level's queue
+            cum = 0.0
+            last_bid = bid_i
+        need = (0.0 if ignore_queue else (q_i if q_i is not None else Q0)) + stake / bid_i
+        while si < len(ss) and ss[si]["timestamp"] < ts_next:
+            s = ss[si]
+            si += 1
+            if s["timestamp"] < ts_i:
+                continue
+            if s["price"] <= bid_i + 1e-9:
+                cum += s["size"]
+                if cum >= need:
+                    return True, bid_i, s["timestamp"]
+    return False, None, None
+
+
 def maker_pnl(B, won, stake):
     sh = stake / B
     per = ((1.0 - B) if won else -B) + REBATE * FEE * B * (1 - B)  # $0 taker fee + rebate
@@ -135,6 +202,7 @@ def main():
     resc = json.loads(RESCACHE.read_text()) if RESCACHE.exists() else {}
     today = datetime.now(timezone.utc).date()
 
+    traj = load_trajectory()
     out = []
     for r in sigs:
         try:
@@ -156,12 +224,16 @@ def main():
         entry = datetime.fromisoformat(r["ts"]).timestamp()
         sells = fetch_no_sells(cid, tok, entry)
         filled, fts = sim_fill(sells, B, Q, our_sh)
+        tk = traj.get(r.get("sig_id"), [])
+        dfilled, dbid, _ = dynamic_fill(r, sells, tk, ignore_queue=False)
+        ufilled, _, _ = dynamic_fill(r, sells, tk, ignore_queue=True)
         out.append({
             "city": r.get("city"), "date": r.get("target_date"), "B": B, "Q": Q,
             "ask": r.get("decision_quote"), "no_won": no == "no", "filled": filled,
             "t2fill_h": ((fts - entry) / 3600) if fts else None,
             "sell_at_B": sum(t["size"] for t in sells if t["price"] <= B + 1e-9),
-            "stake": stake,
+            "stake": stake, "dyn_filled": dfilled, "dyn_bid": dbid, "ub_filled": ufilled,
+            "ticks": len(tk),
         })
         if args.limit and len(out) >= args.limit:
             break
@@ -200,6 +272,18 @@ def main():
         tpnl += sh * (((1.0 - a) if o["no_won"] else -a) - FEE * a * (1 - a))
     print(f"TAKER baseline (always fills at ask): total ${tpnl:+.2f} = ${tpnl/n:+.3f}/signal\n")
 
+    # DYNAMIC re-quoting maker: re-bid to the touch at each trajectory tick (chase the market)
+    dfil = [o for o in out if o["dyn_filled"]]
+    dfr = lambda L: (100 * sum(o["dyn_filled"] for o in L) / len(L)) if L else 0.0
+    dyn_total = sum(maker_pnl(o["dyn_bid"], o["no_won"], o["stake"]) for o in dfil)
+    ub_rate = 100 * sum(o["ub_filled"] for o in out) / n
+    med_ticks = sorted(o["ticks"] for o in out)[n // 2] if n else 0
+    print(f"DYNAMIC re-quoting maker (chase the touch, median {med_ticks} ticks/sig): "
+          f"fill {100*len(dfil)/n:.0f}% (win {dfr(win):.0f}% / lose {dfr(los):.0f}%)  "
+          f"PnL ${dyn_total:+.2f} = ${dyn_total/n:+.3f}/sig")
+    print(f"  upper bound (ignore queue): fill {ub_rate:.0f}%   |   "
+          f"vs static ${blended:+.2f} / taker ${tpnl:+.2f}\n")
+
     summary = {
         "n": n, "fill_rate": 100 * len(filled) / n,
         "win_fill_rate": fr(win), "los_fill_rate": fr(los),
@@ -207,6 +291,8 @@ def main():
         "win_filled": sum(o["filled"] for o in win), "los_filled": sum(o["filled"] for o in los),
         "maker_total": blended, "maker_per_sig": blended / n,
         "taker_total": tpnl, "taker_per_sig": tpnl / n,
+        "dyn_fill_rate": 100 * len(dfil) / n, "dyn_win_fill": dfr(win), "dyn_los_fill": dfr(los),
+        "dyn_maker_total": dyn_total, "dyn_maker_per_sig": dyn_total / n, "ub_fill_rate": ub_rate,
         "generated": datetime.now(timezone.utc).isoformat(),
     }
     Path("data/longshot_fade/maker_fill_summary.json").write_text(json.dumps(summary, indent=2))

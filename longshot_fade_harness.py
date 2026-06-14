@@ -302,9 +302,12 @@ async def track_open():
             b = books.get(tok)
             if b is None:
                 continue
+            qb = round(b.bids[0].size_shares, 1) if getattr(b, "bids", None) else None
+            qa = round(b.asks[0].size_shares, 1) if getattr(b, "asks", None) else None
             f.write(json.dumps({"sig_id": sid, "ts": ts,
                                 "no_bid": round(b.best_bid, 4) if b.best_bid else None,
-                                "no_ask": round(b.best_ask, 4) if b.best_ask else None}) + "\n")
+                                "no_ask": round(b.best_ask, 4) if b.best_ask else None,
+                                "q_bid": qb, "q_ask": qa}) + "\n")
             n += 1
     print(f"tracked {n} open positions -> {TRAJ}", file=sys.stderr)
 
