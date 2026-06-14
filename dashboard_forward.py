@@ -178,6 +178,17 @@ def compute():
                 sd["t_dep"] += ask; sd["t_pnl"] += (ex - ask) - 0.05 * ask * (1 - ask)
             if bid:
                 sd["m_dep"] += bid; sd["m_pnl"] += (ex - bid) + MAKER_REBATE_FRAC * 0.05 * bid * (1 - bid)
+    # per-position dollar P&L (fixed $ stake, net fees) -- pnl per position + total
+    settled_rows, pnl_usd_total = [], 0.0
+    for r, w, p, e in settled:
+        stake = r.get("size_usd") or 5.0
+        sh = (stake / e) if e else 0.0
+        dpnl = sh * p  # p is per-share pnl already net of taker fee
+        pnl_usd_total += dpnl
+        settled_rows.append({"date": r.get("target_date", ""), "city": r.get("city", "?"),
+                             "bucket": r.get("bucket_label", "?"), "entry": e, "won": w,
+                             "pnl_usd": dpnl, "ts": r.get("ts", "")})
+    settled_rows.sort(key=lambda x: x["ts"], reverse=True)
     dates = sorted({r.get("target_date") for r in recs})
     return {
         "n": len(recs), "cities": len({r.get("city") for r in recs}),
@@ -190,6 +201,8 @@ def compute():
         "timing": tg,
         "variants": variants,
         "sweep": sweep,
+        "pnl_usd_total": pnl_usd_total,
+        "settled_rows": settled_rows[:40],
         "recent": recs[-15:][::-1],
     }
 
@@ -208,6 +221,9 @@ def render(s):
     roitxt = f"{roi:+.1f}%" if roi is not None else "—"
     wbar = min(100, win) if win is not None else 0
     gaptxt = f"{s['mean_gap']:+.3f}" if s.get('mean_gap') is not None else "—"
+    ptot = s.get("pnl_usd_total")
+    ptottxt = f"${ptot:+.2f}" if ptot is not None else "—"
+    pcls = "g" if (ptot or 0) > 0 else ("r" if (ptot or 0) < 0 else "y")
     kpis = (
         f"<div class=kpi><div class=lbl>Signals logged</div><div class='val m'>{s['n']}</div>"
         f"<div class=note>{s['cities']} cities · {s['dates'][0]}→{s['dates'][1]}</div></div>"
@@ -217,6 +233,8 @@ def render(s):
         f"<div class=note>paper bar {PAPER_WIN:.0f}%</div><div class=bar><i class='{_cls(win,95,90)}' style='width:{wbar:.0f}%;background:currentColor'></i></div></div>"
         f"<div class=kpi><div class=lbl>Realized ROI / mkt (net fees)</div><div class='val {_cls(roi,15,5)}'>{roitxt}</div>"
         f"<div class=note>paper bar +{PAPER_ROI:.0f}%</div></div>"
+        f"<div class=kpi><div class=lbl>Total PnL</div><div class='val {pcls}'>{ptottxt}</div>"
+        f"<div class=note>$5/position · net fees · {s['settled']} settled</div></div>"
         f"<div class=kpi><div class=lbl>Fill-gap (sim)</div><div class=val>{gaptxt}</div>"
         f"<div class=note>quote→fill slippage</div></div>"
     )
@@ -265,6 +283,39 @@ def render(s):
         rrows += (f"<tr><td>{ts}</td><td>{r.get('city','?')}</td><td>{win}</td><td>{r.get('bucket_label','?')}</td>"
                   f"<td>${r.get('decision_quote',0):.3f}</td>"
                   f"<td>{f'{gap:+.3f}' if isinstance(gap,(int,float)) else '—'}</td></tr>")
+    # per-bet settled PnL table (pnl per position + total)
+    prows = ""
+    for d in s.get("settled_rows", []):
+        cls = "g" if d["pnl_usd"] >= 0 else "r"
+        prows += (f"<tr><td>{d['date']}</td><td>{d['city']}</td><td>{d['bucket']}</td>"
+                  f"<td>${d['entry']:.3f}</td><td class='{'g' if d['won'] else 'r'}'>{'WIN' if d['won'] else 'loss'}</td>"
+                  f"<td class='{cls}'>${d['pnl_usd']:+.2f}</td></tr>")
+    if prows:
+        ptot2 = s.get("pnl_usd_total") or 0.0
+        prows += (f"<tr><td colspan=5 style='text-align:right'><b>TOTAL ({s['settled']} settled)</b></td>"
+                  f"<td class='{'g' if ptot2 >= 0 else 'r'}'><b>${ptot2:+.2f}</b></td></tr>")
+    # measured maker-fill panel (written by analyze_maker_fill.py cron) -- the queue-aware reality
+    mf = {}
+    try:
+        _mfp = Path("data/longshot_fade/maker_fill_summary.json")
+        if _mfp.exists():
+            mf = json.loads(_mfp.read_text())
+    except Exception:
+        mf = {}
+    mfpanel = ""
+    if mf:
+        mkcls = "g" if mf.get("maker_total", 0) >= 0 else "r"
+        tkcls = "g" if mf.get("taker_total", 0) >= 0 else "r"
+        mfrows = (
+            f"<tr><td>fill rate (overall)</td><td>{mf['fill_rate']:.0f}%</td><td>{mf['n']} settled</td></tr>"
+            f"<tr><td>fill rate, NO winners</td><td class=r>{mf['win_fill_rate']:.0f}%</td><td>{mf['win_filled']}/{mf['n_win']} - misses the wins</td></tr>"
+            f"<tr><td>fill rate, NO losers</td><td class=r>{mf['los_fill_rate']:.0f}%</td><td>{mf['los_filled']}/{mf['n_los']} - catches the losses</td></tr>"
+            f"<tr><td><b>maker PnL (measured fills)</b></td><td class='{mkcls}'><b>${mf['maker_total']:+.2f}</b></td><td>${mf['maker_per_sig']:+.3f}/signal</td></tr>"
+            f"<tr><td>taker PnL (always fills)</td><td class='{tkcls}'>${mf['taker_total']:+.2f}</td><td>${mf['taker_per_sig']:+.3f}/signal</td></tr>"
+        )
+        mfpanel = ("<h2>Maker fill - MEASURED (queue-aware, not assumed)</h2>"
+                   "<div class=sub>resting NO bid vs real taker-sell flow + FIFO queue - adverse selection: catches losers, misses winners</div>"
+                   f"<table><tr><th>metric</th><th>value</th><th>detail</th></tr>{mfrows}</table>")
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     return (f"<!doctype html><html><head><meta charset=utf-8><meta http-equiv=refresh content=60>"
             f"<title>weatherbot forward test</title><style>{CSS}</style></head><body><div class=wrap>"
@@ -272,9 +323,11 @@ def render(s):
             f"<div class=sub>NO @ 0.75–0.85 on the basket cities, held to resolution · no orders, no money · refreshed {now}</div>"
             f"<div class=kpis>{kpis}</div>"
             f"<h2>By timing — does same-day a.m. differ from next-day?</h2><table><tr><th>window</th><th>signals</th><th>settled</th><th>win%</th><th>roi</th></tr>{trows}</table>"
-            f"<h2>Hold baseline — net ROI  (maker = rest at bid, assumes fill)</h2><table><tr><th>strategy</th><th>settled</th><th>net ROI</th></tr>{hrows}</table>"
+            f"<h2>Hold baseline — net ROI  (maker-hold ASSUMES 100% fill - optimistic; real fill measured below)</h2><table><tr><th>strategy</th><th>settled</th><th>net ROI</th></tr>{hrows}</table>"
+            f"{mfpanel}"
             f"<h2>Resell sweep — exit when NO bid hits target (vs hold)</h2><table><tr><th>exit</th><th>taker ROI</th><th>maker ROI</th><th>% resold</th></tr>{srows}</table>"
             f"<h2>By city</h2><table><tr><th>city</th><th>signals</th><th>settled</th><th>win%</th><th>roi</th></tr>{crows}</table>"
+            f"<h2>Settled positions — per-bet PnL  ($5 stake, net fees)</h2><table><tr><th>date</th><th>city</th><th>bucket</th><th>entry</th><th>outcome</th><th>PnL</th></tr>{prows}</table>"
             f"<h2>Recent signals</h2><table><tr><th>utc</th><th>city</th><th>win</th><th>bucket</th><th>NO quote</th><th>fill-gap</th></tr>{rrows}</table>"
             f"</div></body></html>")
 
