@@ -100,12 +100,16 @@ def compute():
     settled, maturing = [], 0
     for r in recs:
         try:
-            matured = date.fromisoformat(r["target_date"]) < today
+            td = date.fromisoformat(r["target_date"])
         except Exception:
-            matured = False
-        if not matured:
+            continue
+        if td > today:                  # target day not reached in UTC yet
             maturing += 1
             continue
+        # td <= today: Asia/EU markets close mid-UTC-day, hours before UTC midnight.
+        # closed=true inside resolve_token is the real gate — a same-day market that
+        # hasn't closed yet returns None and falls through to `maturing`, never a
+        # false resolution. This picks Asia/EU up the moment they settle.
         tok = r.get("no_token_id")
         res = cache.get(tok)
         if res is None:
@@ -114,6 +118,7 @@ def compute():
                 cache[tok] = res
                 changed = True
         if res is None:
+            maturing += 1
             continue
         entry = r.get("decision_quote") or 0.0
         no_won = res == "no"

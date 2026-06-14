@@ -226,8 +226,11 @@ async def resolve():
         print("no signals logged yet"); return
     recs = [json.loads(l) for l in LOG.read_text().splitlines() if l.strip()]
     today = datetime.now(timezone.utc).date()
-    matured = [r for r in recs if date.fromisoformat(r["target_date"]) < today]
-    print(f"{len(recs)} logged, {len(matured)} matured (target_date < today)")
+    # target_date <= today: Asia/EU markets close mid-UTC-day (hours before UTC
+    # midnight), so include same-day targets. closed=true below is the real gate —
+    # markets not yet closed return empty and are skipped, never mis-resolved.
+    matured = [r for r in recs if date.fromisoformat(r["target_date"]) <= today]
+    print(f"{len(recs)} logged, {len(matured)} reached target day (<= today UTC)")
     settled = []
     async with httpx.AsyncClient(timeout=30.0) as client:
         for r in matured:
