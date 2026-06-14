@@ -84,8 +84,12 @@ def resolve_no(tok, cache):
     return cache[tok]
 
 
-def fetch_no_sells(cid, tok, entry):
-    """All taker SELL trades on the NO token at/after our entry ts (paged)."""
+def fetch_no_sells(cid, no_tok, yes_tok, entry):
+    """Taker SELL-NO flow at/after entry, normalized across BOTH tokens:
+    a NO-token SELL is selling NO directly; a YES-token BUY is buying YES == selling
+    NO at price (1 - yes_price). These are distinct trades (the data reports each from
+    the taker's chosen token, no double-count), so ~40% of sell-NO flow lives on the
+    YES leg and was previously missed."""
     trades, off = [], 0
     while off < 10000:
         try:
@@ -98,8 +102,16 @@ def fetch_no_sells(cid, tok, entry):
         if min(t["timestamp"] for t in page) < entry:
             break
         off += 500
-    return [t for t in trades
-            if t.get("asset") == tok and t.get("side") == "SELL" and t["timestamp"] >= entry]
+    out = []
+    for t in trades:
+        if t["timestamp"] < entry:
+            continue
+        a = t.get("asset")
+        if a == no_tok and t.get("side") == "SELL":
+            out.append({"timestamp": t["timestamp"], "price": t["price"], "size": t["size"]})
+        elif yes_tok and a == yes_tok and t.get("side") == "BUY":
+            out.append({"timestamp": t["timestamp"], "price": 1.0 - t["price"], "size": t["size"]})
+    return out
 
 
 def sim_fill(sells, B, Q, our_sh):
@@ -222,7 +234,7 @@ def main():
         stake = r.get("size_usd") or 5.0
         our_sh = stake / B
         entry = datetime.fromisoformat(r["ts"]).timestamp()
-        sells = fetch_no_sells(cid, tok, entry)
+        sells = fetch_no_sells(cid, tok, r.get("yes_token_id"), entry)
         filled, fts = sim_fill(sells, B, Q, our_sh)
         tk = traj.get(r.get("sig_id"), [])
         dfilled, dbid, _ = dynamic_fill(r, sells, tk, ignore_queue=False)

@@ -58,6 +58,8 @@ BASKET = {
 
 LOG = Path("data/longshot_fade/signals.jsonl")
 TRAJ = Path("data/longshot_fade/trajectory.jsonl")  # per-open-position NO bid/ask path (resell sim)
+VALUE_LOG = Path("data/longshot_fade/value_open.jsonl")  # "buy cheap YES + hold" inverse-thesis shadow
+VALUE_LO, VALUE_HI = 0.04, 0.20     # cheap-longshot YES band to track (buy-value-at-open test)
 MAKER_REBATE_FRAC = 0.25  # 25% of taker fee redistributed to makers (fees.py)
 
 
@@ -73,6 +75,18 @@ def _load_seen():
             try:
                 r = json.loads(line)
                 seen.add((r["no_token_id"], r["target_date"]))
+            except Exception:
+                continue
+    return seen
+
+
+def _load_value_seen():
+    """(yes_token_id|target_date) already logged to the value-open shadow."""
+    seen = set()
+    if VALUE_LOG.exists():
+        for line in VALUE_LOG.read_text().splitlines():
+            try:
+                seen.add(json.loads(line)["sig_id"])
             except Exception:
                 continue
     return seen
@@ -110,6 +124,44 @@ async def scan(live: bool):
                 continue
             if BAND_LO - 0.06 <= (1.0 - yb) <= BAND_HI + 0.06:
                 pre.append((st, ev, m))
+
+        # --- value-at-open shadow: the "buy cheap YES longshot + hold" inverse thesis ---
+        # Operator-requested measurement of the idea the model ranked LOW. Defensive:
+        # a failure here must NEVER break the main fade scan. Separate file + analyzer.
+        try:
+            vseen = _load_value_seen()
+            vrows = []
+            for st, ev, m in cand:
+                if not m.yes_token_id:
+                    continue
+                yb, _ = fresh.get(m.yes_token_id, (m.yes_bid, m.yes_ask))
+                if yb is None or not (VALUE_LO <= yb <= VALUE_HI):
+                    continue
+                td = event_target_date(ev, st)
+                local_now = datetime.now(ZoneInfo(st.timezone))
+                if td > local_now.date():
+                    vtiming = "next_day"
+                elif td == local_now.date() and local_now.hour < PEAK_HOUR.get(st_target(ev), 12):
+                    vtiming = "same_day_am"
+                else:
+                    continue
+                vkey = f"{m.yes_token_id}|{td.isoformat()}"
+                if vkey in vseen:
+                    continue
+                vseen.add(vkey)
+                vrows.append({"ts": _now_iso(), "sig_id": vkey, "city": st.name,
+                              "target_date": td.isoformat(), "bucket_label": m.bucket_label,
+                              "yes_token_id": m.yes_token_id, "yes_price": round(yb, 4),
+                              "timing": vtiming, "size_usd": SIZE_USD})
+            if vrows:
+                VALUE_LOG.parent.mkdir(parents=True, exist_ok=True)
+                with VALUE_LOG.open("a") as vf:
+                    for vr in vrows:
+                        vf.write(json.dumps(vr) + "\n")
+                print(f"  [value-open] logged {len(vrows)} cheap-YES buckets", file=sys.stderr)
+        except Exception as e:
+            print(f"  [value-open] skipped: {e}", file=sys.stderr)
+
         books = await fetch_orderbook_depths_batch([m.no_token_id for _, _, m in pre], client)
 
         live_client = None
