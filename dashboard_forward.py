@@ -315,14 +315,14 @@ def render(s):
             )
         mfrows = (
             f"<tr><td>static fill rate (overall)</td><td>{mf['fill_rate']:.0f}%</td><td>{mf['n']} settled</td></tr>"
-            f"<tr><td>static fill, NO winners</td><td class=r>{mf['win_fill_rate']:.0f}%</td><td>{mf['win_filled']}/{mf['n_win']} - misses the wins</td></tr>"
-            f"<tr><td>static fill, NO losers</td><td class=r>{mf['los_fill_rate']:.0f}%</td><td>{mf['los_filled']}/{mf['n_los']} - catches the losses</td></tr>"
+            f"<tr><td>static fill, NO winners</td><td>{mf['win_fill_rate']:.0f}%</td><td>{mf['win_filled']}/{mf['n_win']} filled</td></tr>"
+            f"<tr><td>static fill, NO losers</td><td>{mf['los_fill_rate']:.0f}%</td><td>{mf['los_filled']}/{mf['n_los']} filled</td></tr>"
             f"<tr><td><b>static maker PnL</b></td><td class='{mkcls}'><b>${mf['maker_total']:+.2f}</b></td><td>${mf['maker_per_sig']:+.3f}/signal (rest once, no re-quote)</td></tr>"
             + dynrows +
             f"<tr><td>taker PnL (always fills)</td><td class='{tkcls}'>${mf['taker_total']:+.2f}</td><td>${mf['taker_per_sig']:+.3f}/signal</td></tr>"
         )
         mfpanel = ("<h2>Maker fill - MEASURED (queue-aware, not assumed)</h2>"
-                   "<div class=sub>resting NO bid vs real taker-sell flow + FIFO queue - adverse selection: catches losers, misses winners</div>"
+                   "<div class=sub>resting NO bid vs real both-token sell-NO flow + FIFO queue - recreational YES-lottery buying fills our bid; rest-at-bid beats taker</div>"
                    f"<table><tr><th>metric</th><th>value</th><th>detail</th></tr>{mfrows}</table>")
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     return (f"<!doctype html><html><head><meta charset=utf-8><meta http-equiv=refresh content=60>"
