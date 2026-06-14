@@ -43,12 +43,14 @@ echo "[4/6] dry-run smoke test (no orders) ..."
 cd "$DIR"
 PYTHONUTF8=1 "$PY" longshot_fade_harness.py | tail -3
 
-echo "[5/7] install cron: scan hourly, resolve daily 23:30 UTC ..."
+echo "[5/7] install cron: scan hourly, resolve daily 23:30, maker-fill 11:45+23:45 UTC ..."
 SCAN="cd $DIR && PYTHONUTF8=1 $PY longshot_fade_harness.py >> $DIR/data/longshot_fade/scan.log 2>&1"
 RES="cd $DIR && PYTHONUTF8=1 $PY longshot_fade_harness.py --resolve >> $DIR/data/longshot_fade/resolve_report.txt 2>&1"
-{ crontab -l 2>/dev/null | grep -v 'longshot_fade_harness.py' || true
+MFILL="cd $DIR && PYTHONUTF8=1 $PY analyze_maker_fill.py >> $DIR/data/longshot_fade/maker_fill.log 2>&1"
+{ crontab -l 2>/dev/null | grep -v 'longshot_fade_harness.py' | grep -v 'analyze_maker_fill.py' || true
   echo "0 * * * * $SCAN"
   echo "30 23 * * * $RES"
+  echo "45 11,23 * * * $MFILL"
 } | crontab -
 
 echo "[6/7] dashboard systemd service on 127.0.0.1:8765 ..."
@@ -79,6 +81,6 @@ echo "  signals   : $DIR/data/longshot_fade/signals.jsonl"
 echo "  watch scan: tail -f $DIR/data/longshot_fade/scan.log"
 echo "  DASHBOARD : tunnel from your laptop, then open http://localhost:8765 :"
 echo "              ssh -L 8765:127.0.0.1:8765 root@199.247.29.13"
-echo "  stop all  : crontab -l|grep -v longshot_fade_harness.py|crontab -; systemctl disable --now weatherbot-dash"
+echo "  stop all  : crontab -l|grep -vE 'longshot_fade_harness.py|analyze_maker_fill.py'|crontab -; systemctl disable --now weatherbot-dash"
 echo "--- installed cron ---"
-crontab -l | grep longshot_fade_harness.py
+crontab -l | grep -E 'longshot_fade_harness.py|analyze_maker_fill.py'
